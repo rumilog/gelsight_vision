@@ -8,6 +8,7 @@ setup(
     packages=find_packages(exclude=['test']),
     package_data={
         'gelsight_vision.gsrobotics': ['models/*.pt', 'LICENSE'],
+        'gelsight_vision.tools': ['models/*.pt', 'models/*.json'],
     },
     include_package_data=True,
     data_files=[

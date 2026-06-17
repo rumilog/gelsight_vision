@@ -1,6 +1,5 @@
 import os
 import cv2
-import numpy as np
 import rclpy
 import threading
 import time
@@ -8,12 +7,8 @@ import time
 from datetime import datetime
 from action_msgs.msg import GoalStatus
 from cv_bridge import CvBridge
-from geometry_msgs.msg import Pose, Point, Quaternion, TwistStamped, WrenchStamped
-from gelsight_vision.gelsight.height_map import HeightMapper, save_height_preview
-from gelsight_vision.gelsight.stitch import stitch_session
-from gelsight_vision.gelsight.touch import touch
+from geometry_msgs.msg import Pose, Point, Quaternion
 from math import radians
-from moveit_msgs.srv import ServoCommandType
 from rclpy.action.client import ActionClient
 from rclpy.node import Node
 from sensor_msgs.msg import Image
@@ -21,44 +16,32 @@ from robot_manager_interfaces.action import PoseGoal
 from robot_manager_interfaces.srv import Home
 from tf_transformations import quaternion_from_euler
 
+from gelsight_vision.gelsight.height_map import HeightMapper
+from gelsight_vision.pipeline.crop_d555 import crop_rgb_stitched
+from gelsight_vision.pipeline.visualize import draw_weld_patch_overlay, show
+from gelsight_vision.tools.find_weld_patch import find_weld_patch, score_patches
+
+
 class PipelineVisuoTactile(Node):
     def __init__(self):
         super().__init__('pipeline_visuo_tactile')
 
-        # Assigns namespace to ur20
         _ = self.declare_parameter('ns', 'ur20')
         _ = self.declare_parameter('frame_id', 'plate')
-        _ = self.declare_parameter('force_max', 4.0)
-        _ = self.declare_parameter('mock', False)
-        _ = self.declare_parameter('touch_x', 1)
-        _ = self.declare_parameter('touch_y', 1)
+        _ = self.declare_parameter('weld_threshold', 0.5)
+        _ = self.declare_parameter('show_preview', True)
         _ = self.declare_parameter(
             'capture_root',
-            # '/home/ppak/HuggingFace/Datasets/Gelsight-Welds/source/v2',
             '/home/ppak/ros2_ws/src/gelsight_vision/captures_visuo_tactile',
         )
-        # RealSense D5xx publishes /depth/image_rect_raw as 16UC1 in raw device
-        # units; multiply by depth_scale (meters per raw unit) to get distance.
-        # 0.001 is the standard value for D435/D455/D555 stereo depth.
-        _ = self.declare_parameter('d555_depth_scale', 0.001)
 
         self.ns: str = str(self.get_parameter('ns').value)
         self.frame_id: str = str(self.get_parameter('frame_id').value)
-        self.force_max: float = float(self.get_parameter('force_max').value)
-        self.mock: bool = bool(self.get_parameter('mock').value)
-        self.touch_x: int = int(self.get_parameter('touch_x').value)
-        self.touch_y: int = int(self.get_parameter('touch_y').value)
-        self.d555_depth_scale: float = float(
-            self.get_parameter('d555_depth_scale').value
-        )
+        self.weld_threshold: float = float(self.get_parameter('weld_threshold').value)
+        self.show_preview: bool = bool(self.get_parameter('show_preview').value)
 
         self.gelsight_frame = None
         self.d555_frame = None
-        self.d555_depth_frame = None
-
-        # Force values
-        self.force = 0.0
-        self.offset = 0.0
 
         # Capture image flags
         self.gelsight_capture_image = False
@@ -70,7 +53,6 @@ class PipelineVisuoTactile(Node):
         session = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
         self.capture_dir = os.path.join(capture_root, session)
         os.makedirs(self.capture_dir, exist_ok=True)
-        self.gelsight_capture_count = 0
         self.d555_capture_count = 0
 
         self.height_mapper = HeightMapper()
@@ -83,24 +65,14 @@ class PipelineVisuoTactile(Node):
         self.pose_goal_client.wait_for_server()
 
         self.home_client = self.create_client(Home, self.ns + "/" + "home")
-
         while not self.home_client.wait_for_service():
-            sleep(1.0)
-            print("waiting for service")
-            continue
-
-        # Force Subscriber
-        self.force_subscriber = self.create_subscription(
-            WrenchStamped, 
-            # self.ns + '/force_torque_sensor_broadcaster/wrench_filtered',
-            self.ns + '/wrench',
-            self.force_callback, 
-            10
-        )
+            time.sleep(1.0)
+            self.get_logger().info("waiting for service: " + self.ns + "/home")
 
         self.cv_bridge = CvBridge()
 
-        # Gelsight Subscriber
+        # Gelsight Subscriber (baseline calibration only for now; per-touch
+        # captures will land here once Tool 2 is wired in).
         self.gelsight_subscriber = self.create_subscription(
             Image,
             'gelsight_capture/image',
@@ -108,7 +80,7 @@ class PipelineVisuoTactile(Node):
             10
         )
 
-        # D555 Subscriber
+        # D555 RGB Subscriber
         self.d555_subscriber = self.create_subscription(
             Image,
             'gelsight_vision_d555/color/image_raw',
@@ -116,56 +88,14 @@ class PipelineVisuoTactile(Node):
             10
         )
 
-        # D555 Depth Subscriber (keeps latest depth frame so it can be saved
-        # alongside the color image when the capture trigger fires).
-        self.d555_depth_subscriber = self.create_subscription(
-            Image,
-            'gelsight_vision_d555/depth/image_rect_raw',
-            self.d555_depth_listener_callback,
-            10
-        )
-
-        # Twist Publisher
-        self.twist_publisher = self.create_publisher(
-            TwistStamped, 
-            self.ns + '/servo_node/delta_twist_cmds', 
-            10
-        )
-
-        # Enable Servo
-        self.servo_client = self.create_client(ServoCommandType, self.ns + '/servo_node/switch_command_type')
-        while not self.servo_client.wait_for_service(timeout_sec=1.0): 
-            self.get_logger().info("Waiting for service: " + self.ns + '/servo_node/switch_command_type')
-        req = ServoCommandType.Request()
-        req.command_type = ServoCommandType.Request.TWIST
-        future = self.servo_client.call_async(req)
-        rclpy.spin_until_future_complete(self, future)
-
     def gelsight_listener_callback(self, msg):
         if self.gelsight_calibrate:
             frame = self.cv_bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
             baseline_path = os.path.join(self.capture_dir, "gelsight_baseline.png")
             cv2.imwrite(baseline_path, self.height_mapper.crop_native(frame))
             self.height_mapper.calibrate(frame)
-            print(f"gelsight baseline -> {baseline_path}")
+            self.get_logger().info(f"gelsight baseline -> {baseline_path}")
             self.gelsight_calibrate = False
-            return
-        if self.gelsight_capture_image:
-            self.gelsight_frame = self.cv_bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
-            self.gelsight_capture_count += 1
-            stem = f"gelsight_{self.gelsight_capture_count:04d}"
-            img_path = os.path.join(self.capture_dir, f"{stem}.png")
-            depth_path = os.path.join(self.capture_dir, f"{stem}_depth.npy")
-            preview_path = os.path.join(self.capture_dir, f"{stem}_depth_preview.png")
-            cropped_frame = self.height_mapper.crop_native(self.gelsight_frame)
-            cv2.imwrite(img_path, cropped_frame)
-            height = self.height_mapper.image_to_height_tensor(self.gelsight_frame).numpy()
-            np.save(depth_path, height)
-            save_height_preview(height, preview_path)
-            print(f"gelsight captured frame -> {img_path}")
-            print(f"gelsight depth -> {depth_path}")
-            print(f"gelsight depth preview -> {preview_path}")
-            self.gelsight_capture_image = False
 
     def d555_listener_callback(self, msg):
         if self.d555_capture_image:
@@ -173,73 +103,9 @@ class PipelineVisuoTactile(Node):
             self.d555_capture_count += 1
             stem = f"d555_{self.d555_capture_count:04d}"
             color_path = os.path.join(self.capture_dir, f"{stem}.png")
-            depth_path = os.path.join(self.capture_dir, f"{stem}_depth.png")
-            depth_npy_path = os.path.join(self.capture_dir, f"{stem}_depth.npy")
             cv2.imwrite(color_path, self.d555_frame)
-            print(f"d555 captured frame -> {color_path}")
-            if self.d555_depth_frame is not None:
-                cv2.imwrite(depth_path, self.d555_depth_frame)
-                np.save(depth_npy_path, self.d555_depth_frame)
-                print(f"d555 captured depth -> {depth_path}")
-                print(f"d555 captured depth -> {depth_npy_path}")
-            else:
-                print("d555 depth frame not yet received; depth not saved")
+            self.get_logger().info(f"d555 captured frame -> {color_path}")
             self.d555_capture_image = False
-
-    def d555_depth_listener_callback(self, msg):
-        # CV_16UC1 -> uint16 numpy array; raw values are in device units.
-        self.d555_depth_frame = self.cv_bridge.imgmsg_to_cv2(
-            msg, desired_encoding="16UC1"
-        )
-
-    def d555_distance_at(self, x: int, y: int) -> float:
-        """Return the distance in meters at pixel (x, y) of the latest D555
-        depth frame, or NaN if no frame has been received or the pixel has
-        no valid depth (raw 0)."""
-        if self.d555_depth_frame is None:
-            return float("nan")
-        raw = int(self.d555_depth_frame[y, x])
-        if raw == 0:
-            return float("nan")
-        return raw * self.d555_depth_scale
-
-    #### Movement
-    def move_z(self, speed):
-        twist_msg = TwistStamped()
-        twist_msg.header.stamp = self.get_clock().now().to_msg()
-        twist_msg.header.frame_id = self.frame_id
-        twist_msg.twist.linear.z = speed
-        self.twist_publisher.publish(twist_msg)
-    def stop(self):
-        twist_msg = TwistStamped()
-        twist_msg.header.stamp = self.get_clock().now().to_msg()
-        twist_msg.header.frame_id = self.frame_id
-        twist_msg.twist.linear.x = 0.0
-        twist_msg.twist.linear.y = 0.0
-        twist_msg.twist.linear.z = 0.0
-        twist_msg.twist.angular.x = 0.0
-        twist_msg.twist.angular.y = 0.0
-        twist_msg.twist.angular.z = 0.0
-        self.twist_publisher.publish(twist_msg)
-
-    #### Force Sensor
-    def force_callback(self, msg: WrenchStamped):
-        force = 0
-        force += abs(msg.wrench.force.z)
-        self.force = abs(abs(force) - abs(self.offset))
-    def calibrate_sensor(self, calibration_range = 100):
-        self.get_logger().info("Starting sensor calibration")
-        self.offset = 0.0
-        data = []
-        time.sleep(0.1)
-
-        for _ in range(calibration_range):
-            data.append(self.force)
-            time.sleep(0.01)
-        self.offset = sum(data) / len(data)
-        time.sleep(0.1)
-        self.force = 0 # Potential solution to race condition of node.force >= force_max
-        self.get_logger().info(f"Calibration finished! Offset: {self.offset}")
 
     def run_action(
             self,
@@ -247,7 +113,6 @@ class PipelineVisuoTactile(Node):
             goal_msg,
             show_progress: bool = False
         ):
-
         feedback_callback = lambda msg: self.get_logger().info(
             f'Progress: {msg.feedback.progress:.1f}%'
         )
@@ -265,6 +130,7 @@ class PipelineVisuoTactile(Node):
         if status != GoalStatus.STATUS_SUCCEEDED:
             self.get_logger().error(result.result.message)
             exit(1)
+
 
 def main(args=None):
     rclpy.init(args=args)
@@ -290,11 +156,9 @@ def main(args=None):
         request.speed = 0.1
         node.home_client.call(request)
 
+        # Move to camera_focus pose for the D555 overview.
         q = quaternion_from_euler(radians(0.0), radians(0.0), radians(0.0))
-
-        # Create pose goal for moving camera focus
         goal_msg = PoseGoal.Goal()
-
         goal_msg.target_pose = Pose(
             position=Point(x=0.0, y=0.0, z=0.0),
             orientation=Quaternion(x=q[0], y=q[1], z=q[2], w=q[3])
@@ -302,82 +166,56 @@ def main(args=None):
         goal_msg.velocity_scaling = 0.1
         goal_msg.acceleration_scaling = 0.1
         goal_msg.frame_id = node.frame_id
-        goal_msg.target_id = "camera_focus" # Can be any child of tool0. If empty -> tool0 used
-        goal_msg.method = "PTP" # Point-to-Point
+        goal_msg.target_id = "camera_focus"
+        goal_msg.method = "PTP"
 
-        # Execute pose goal 
-        _ = node.get_logger().info("Moving Camera Focus")
-        _ = node.run_action(node.pose_goal_client, goal_msg)
-        _ = node.get_logger().info("Finished Moving Camera Focus")
+        node.get_logger().info("Moving Camera Focus")
+        node.run_action(node.pose_goal_client, goal_msg)
+        node.get_logger().info("Finished Moving Camera Focus")
 
+        # Let the arm settle before grabbing the overview.
         time.sleep(5.0)
-        # Realsense picture take
         node.d555_capture_image = True
+        while node.d555_capture_image:
+            time.sleep(0.1)
 
-        time.sleep(5.0)
+        # Tool 1: find_weld_patch on the cropped overview.
+        rgb_stitched_bgr = crop_rgb_stitched(node.d555_frame)
+        stitched_path = os.path.join(node.capture_dir, "rgb_stitched.png")
+        cv2.imwrite(stitched_path, rgb_stitched_bgr)
+        node.get_logger().info(f"rgb_stitched -> {stitched_path}")
 
-        # input("Press any key to continue")
-
-        q = quaternion_from_euler(radians(0.0), radians(0.0), radians(0.0))
-        orientation = Quaternion(x=q[0], y=q[1], z=q[2], w=q[3])
-
-        # Full-sensor lateral FOV of the gel surface, in meters. The depth
-        # pipeline crops `border_fraction` from each side, so we step the robot
-        # by the *cropped* FOV to make adjacent touches butt up against one
-        # another in the stitched view.
-        gelsight_full_width = 0.020
-        gelsight_full_height = 0.015
-        keep = node.height_mapper.keep_fraction
-        gelsight_width = gelsight_full_width * keep
-        gelsight_height = gelsight_full_height * keep
-
-        i_mid = (node.touch_x // 2)
-        j_mid = (node.touch_y // 2)
-
-        print(f"i_mid: {i_mid}, j_mid: {j_mid}")
-
-        for i in range(node.touch_x, 0, -1):
-            x = (-i_mid + i) * gelsight_width 
-
-            for j in range(node.touch_y, 0, -1):
-                y = (-j_mid + j) * gelsight_height
-
-
-                print(f"i: {i}, j: {j}, x: {x}, y: {y}")
-                touch(
-                    node=node,
-                    frame_id=node.frame_id,
-                    mock=node.mock,
-                    position=Point(x=x, y=y, z=0.02),
-                    orientation=orientation,
-                )
-
-        _ = node.get_logger().info("Stitching session captures...")
-        stitch_session(
-            session_dir=node.capture_dir,
-            touch_x=node.touch_x,
-            touch_y=node.touch_y,
+        # Tool 1 scores each per-tile crop with the CNN, then thresholds.
+        scores = score_patches(node.d555_frame)
+        selected = find_weld_patch(scores, threshold=node.weld_threshold)
+        node.get_logger().info(
+            f"find_weld_patch(threshold={node.weld_threshold}) -> "
+            f"{len(selected)} patches: {selected}"
         )
 
-        # input("Press any key to continue")
-        # Execute pose goal
-        _ = node.get_logger().info("Moving Camera Focus")
-        _ = node.run_action(node.pose_goal_client, goal_msg)
-        _ = node.get_logger().info("Finished Moving Camera Focus")
+        overlay = draw_weld_patch_overlay(
+            rgb_stitched_bgr, scores, threshold=node.weld_threshold,
+        )
+        overlay_path = os.path.join(node.capture_dir, "rgb_stitched_weld_patches.png")
+        cv2.imwrite(overlay_path, overlay)
+        node.get_logger().info(f"weld patch overlay -> {overlay_path}")
 
-        # input("Press any key to continue")
+        if node.show_preview:
+            node.get_logger().info("Showing preview window — press any key to continue.")
+            show(overlay, title="find_weld_patch (any key to continue)")
+
         # Send request to home robot arm
         request = Home.Request()
         request.speed = 0.1
         node.home_client.call(request)
 
     except KeyboardInterrupt:
-        _ = node.get_logger().info("Script interrupted by user.")
+        node.get_logger().info("Script interrupted by user.")
     finally:
         node.destroy_node()
         rclpy.shutdown()
         spin_thread.join()
 
+
 if __name__ == '__main__':
     main()
-
