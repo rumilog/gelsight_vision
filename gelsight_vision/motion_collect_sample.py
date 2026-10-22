@@ -27,6 +27,7 @@ from gelsight_vision.gelsight.height_map import HeightMapper, save_height_previe
 from gelsight_vision.gelsight.stitch import (
     stitch_session,
     stitch_session_anchored,
+    stitch_session_solved,
     write_anchored_ply,
     write_stitched_ply,
 )
@@ -54,6 +55,10 @@ class MotionCollectSample(Node):
         _ = self.declare_parameter('mock', False)
         _ = self.declare_parameter('touch_x', 1)
         _ = self.declare_parameter('touch_y', 1)
+        # Fraction of the cropped gelsight FOV shared by neighbouring touches.
+        # 0 = tiles butt up (seam constraints only); ~0.2-0.3 gives the
+        # overlap-based Z solve real shared pixels to match.
+        _ = self.declare_parameter('touch_overlap', 0.0)
         _ = self.declare_parameter(
             'capture_root',
             # '/home/ppak/HuggingFace/Datasets/Gelsight-Welds/source/v2',
@@ -78,6 +83,7 @@ class MotionCollectSample(Node):
         self.mock: bool = bool(self.get_parameter('mock').value)
         self.touch_x: int = int(self.get_parameter('touch_x').value)
         self.touch_y: int = int(self.get_parameter('touch_y').value)
+        self.touch_overlap: float = float(self.get_parameter('touch_overlap').value)
         self.d555_depth_scale: float = float(
             self.get_parameter('d555_depth_scale').value
         )
@@ -782,8 +788,8 @@ def main(args=None):
         gelsight_full_width = 0.020
         gelsight_full_height = 0.015
         keep = node.height_mapper.keep_fraction
-        gelsight_width = gelsight_full_width * keep
-        gelsight_height = gelsight_full_height * keep
+        gelsight_width = gelsight_full_width * keep * (1.0 - node.touch_overlap)
+        gelsight_height = gelsight_full_height * keep * (1.0 - node.touch_overlap)
         i_mid = (node.touch_x // 2)
         j_mid = (node.touch_y // 2)
         node.get_logger().info(
@@ -826,6 +832,14 @@ def main(args=None):
             session_dir=node.capture_dir,
             touch_x=node.touch_x,
             touch_y=node.touch_y,
+        )
+        # Per-tile Z offsets solved from tile overlaps/seams, with contact Z
+        # as a robust weak prior. Writes gelsight_solved_* (depth, RGB, views, PLY).
+        stitch_session_solved(
+            session_dir=node.capture_dir,
+            touch_x=node.touch_x,
+            touch_y=node.touch_y,
+            touch_overlap=node.touch_overlap,
         )
         # Transform the stereo PLY into world coords and combine with the
         # anchored gelsight PLY. Uses camera_focus pose as camera-frame proxy

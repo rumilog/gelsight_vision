@@ -128,6 +128,7 @@ def save_height_preview(
     num_ticks: int = 5,
     unit: str = "mm",
     scale_factor: float = PX_TO_MM,
+    value_range: Optional[tuple[float, float]] = None,
 ) -> None:
     """Save a colormapped PNG preview of a (H, W) height array with a vertical
     scale bar on the right. Tick values are displayed in `unit`, computed as
@@ -135,16 +136,25 @@ def save_height_preview(
     matches the gsrobotics lateral pixel size at 320x240; the depth output of
     poisson_dct_neumann is in the same pixel units, so this gives an
     approximate mm reading. The saved .npy keeps the raw values; only the
-    preview labels are scaled."""
+    preview labels are scaled.
+
+    `colormap` may be an OpenCV colormap id or a (256, 1, 3) uint8 LUT.
+    `value_range` (lo, hi) overrides the percentile clip. NaN pixels are
+    drawn dark gray."""
     if isinstance(height, torch.Tensor):
         height = height.detach().cpu().numpy()
-    lo, hi = np.percentile(height, percentile_clip)
-    clipped = np.clip(height, lo, hi)
+    nan_mask = ~np.isfinite(height)
+    if value_range is not None:
+        lo, hi = value_range
+    else:
+        lo, hi = np.nanpercentile(height, percentile_clip)
+    clipped = np.clip(np.where(nan_mask, lo, height), lo, hi)
     if hi - lo < 1e-9:
         normalized = np.zeros_like(clipped, dtype=np.uint8)
     else:
         normalized = ((clipped - lo) / (hi - lo) * 255).astype(np.uint8)
     preview = cv2.applyColorMap(normalized, colormap)
+    preview[nan_mask] = (40, 40, 40)
 
     h, w = preview.shape[:2]
     gap = 10

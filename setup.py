@@ -35,6 +35,7 @@ setup(
     entry_points={
         'console_scripts': [
             'motion_collect_sample = gelsight_vision.motion_collect_sample:main',
+            'motion_collect_overlap = gelsight_vision.motion_collect_overlap:main',
             'pipeline_visuo_tactile = gelsight_vision.pipeline_visuo_tactile:main',
             'set_plate = gelsight_vision.set_plate:main',
         ],
