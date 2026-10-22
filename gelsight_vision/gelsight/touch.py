@@ -44,7 +44,12 @@ def touch(
                 node.stop()
                 break
             time.sleep(0.002)
-    
+
+    # Snapshot the arm pose the instant force-threshold trips. gelsight
+    # callback drains this into the per-touch pose JSON later.
+    if hasattr(node, 'snapshot_touch_pose'):
+        node.snapshot_touch_pose()
+
     time.sleep(2.0)
 
     # Gelsight picture take

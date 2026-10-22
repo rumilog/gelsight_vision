@@ -51,3 +51,8 @@ qtcreator-*
 
 # Catkin custom files
 CATKIN_IGNORE
+
+# Palette EMA weights are never loaded (see agentic_sr CLAUDE.md "EMA trap").
+# Skip 260MB we'd otherwise commit unused.
+gelsight_vision/tools/palette_models/checkpoint/*_ema.pth
+

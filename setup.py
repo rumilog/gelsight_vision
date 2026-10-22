@@ -8,7 +8,12 @@ setup(
     packages=find_packages(exclude=['test']),
     package_data={
         'gelsight_vision.gsrobotics': ['models/*.pt', 'LICENSE'],
-        'gelsight_vision.tools': ['models/*.pt', 'models/*.json'],
+        'gelsight_vision.tools': [
+            'models/*.pt', 'models/*.json',
+            'palette_models/checkpoint/2000_Network.pth',
+            'palette_models/checkpoint/config.json',
+            'palette_models/README.md',
+        ],
     },
     include_package_data=True,
     data_files=[
