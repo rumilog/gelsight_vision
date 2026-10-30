@@ -30,6 +30,16 @@ Touches run in serpentine order to cut travel; files are still numbered
 row-major (k -> row (k-1)//touch_y, col (k-1)%touch_y) so the stitcher's grid
 mapping holds. Tactile-only: no D555 / IGEV.
 
+`use_gelsight:=False` runs the motion only (no baseline, captures, stitch or
+comparison) -- pair with `mock:=True` to dry-run the sweep on mock hardware.
+
+`plate_x_mm` / `plate_y_mm` > 0 scan the whole plate instead: the plate-frame
+origin is taken as the plate's corner, the plate extends along plate +x / +y,
+and `area_*` / `center_*` are ignored.
+
+    ros2 run gelsight_vision motion_collect_overlap --ros-args \
+        -p plate_x_mm:=100.0 -p plate_y_mm:=60.0 -p overlaps:="[0.5]"
+
     ros2 run gelsight_vision motion_collect_overlap --ros-args \\
         -p frame_id:=plate -p mock:=False \\
         -p area_x_mm:=30.0 -p area_y_mm:=30.0 -p overlaps:="[0.5, 0.33, 0.25, 0.1]"
@@ -92,11 +102,17 @@ class MotionCollectOverlap(Node):
         _ = self.declare_parameter('frame_id', 'plate')
         _ = self.declare_parameter('force_max', 4.0)
         _ = self.declare_parameter('mock', False)
+        # False: motion-only dry run -- no gelsight subscription, captures or stitching.
+        _ = self.declare_parameter('use_gelsight', True)
         # Plate area to scan (mm) and its centre in the plate frame (m).
         _ = self.declare_parameter('area_x_mm', 30.0)
         _ = self.declare_parameter('area_y_mm', 30.0)
         _ = self.declare_parameter('center_x', 0.0)
         _ = self.declare_parameter('center_y', 0.0)
+        # Whole-plate scan: plate size (mm) from the plate-frame origin (its
+        # corner) along +x / +y. Both > 0 overrides area_* / center_*.
+        _ = self.declare_parameter('plate_x_mm', 0.0)
+        _ = self.declare_parameter('plate_y_mm', 0.0)
         # One full scan of the area per entry, in this order. Linear fraction
         # of the cropped FOV shared with each neighbour, per axis.
         _ = self.declare_parameter('overlaps', [0.5, 0.33, 0.25, 0.1])
@@ -104,13 +120,16 @@ class MotionCollectOverlap(Node):
         _ = self.declare_parameter('rebaseline_each_run', True)
         # Plate-frame Z the tooltip approaches from before each descent.
         _ = self.declare_parameter('safe_z', 0.02)
-        _ = self.declare_parameter('descent_speed', -0.025)
+        # Servo twist in m/s (servo command_in_type: speed_units).
+        _ = self.declare_parameter('descent_speed', -0.005)
         # Contact must happen at least this far below the start Z, else the
         # force trip is treated as spurious and the touch retried.
         _ = self.declare_parameter('min_descent_m', 0.001)
         # Abort a descent that goes this far without reaching force_max.
         _ = self.declare_parameter('max_descent_m', 0.035)
         _ = self.declare_parameter('max_attempts', 3)
+        # Abort the sweep if the tooltip Z doesn't change for this long while descending.
+        _ = self.declare_parameter('stall_s', 5.0)
         # Readings >= force_max needed in a row to count as contact.
         _ = self.declare_parameter('trip_samples', 3)
         # Wait after each PTP move before zeroing the force sensor, so the
@@ -124,6 +143,7 @@ class MotionCollectOverlap(Node):
         self.frame_id: str = str(self.get_parameter('frame_id').value)
         self.force_max: float = float(self.get_parameter('force_max').value)
         self.mock: bool = bool(self.get_parameter('mock').value)
+        self.use_gelsight: bool = bool(self.get_parameter('use_gelsight').value)
         self.area_m = (
             float(self.get_parameter('area_x_mm').value) / 1000.0,
             float(self.get_parameter('area_y_mm').value) / 1000.0,
@@ -132,6 +152,15 @@ class MotionCollectOverlap(Node):
             float(self.get_parameter('center_x').value),
             float(self.get_parameter('center_y').value),
         )
+        plate_mm = (
+            float(self.get_parameter('plate_x_mm').value),
+            float(self.get_parameter('plate_y_mm').value),
+        )
+        self.plate_m: tuple[float, float] | None = None
+        if plate_mm[0] > 0.0 and plate_mm[1] > 0.0:
+            self.plate_m = (plate_mm[0] / 1000.0, plate_mm[1] / 1000.0)
+            self.area_m = self.plate_m
+            self.center = (self.plate_m[0] / 2.0, self.plate_m[1] / 2.0)
         self.overlaps: list[float] = [float(o) for o in self.get_parameter('overlaps').value]
         self.rebaseline_each_run: bool = bool(self.get_parameter('rebaseline_each_run').value)
         self.safe_z: float = float(self.get_parameter('safe_z').value)
@@ -139,6 +168,7 @@ class MotionCollectOverlap(Node):
         self.min_descent_m: float = float(self.get_parameter('min_descent_m').value)
         self.max_descent_m: float = float(self.get_parameter('max_descent_m').value)
         self.max_attempts: int = int(self.get_parameter('max_attempts').value)
+        self.stall_s: float = float(self.get_parameter('stall_s').value)
         self.trip_samples: int = int(self.get_parameter('trip_samples').value)
         self.settle_s: float = float(self.get_parameter('settle_s').value)
         bad = [o for o in self.overlaps if not 0.0 <= o < 1.0]
@@ -176,9 +206,10 @@ class MotionCollectOverlap(Node):
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
-        self.gelsight_subscriber = self.create_subscription(
-            Image, 'gelsight_capture/image', self.gelsight_listener_callback, 10,
-        )
+        if self.use_gelsight:
+            self.gelsight_subscriber = self.create_subscription(
+                Image, 'gelsight_capture/image', self.gelsight_listener_callback, 10,
+            )
 
     #### Gelsight
     def gelsight_listener_callback(self, msg):
@@ -250,7 +281,8 @@ class MotionCollectOverlap(Node):
 
     def descend_until_contact(self, start_z: float | None) -> str:
         """Servo down until force_max holds for `trip_samples` readings.
-        Returns 'contact', or 'no_contact' if max_descent_m is exceeded."""
+        Returns 'contact', or 'no_contact' if max_descent_m is exceeded.
+        Raises if the tooltip doesn't move (servo halted / not commanding)."""
         if self.mock:
             for _ in range(1000):
                 self.move_z(self.descent_speed)
@@ -258,6 +290,7 @@ class MotionCollectOverlap(Node):
             return 'contact'
         streak = 0
         ticks = 0
+        last_z, last_move_t = start_z, time.time()
         while True:
             self.move_z(self.descent_speed)
             streak = streak + 1 if self.force >= self.force_max else 0
@@ -267,9 +300,21 @@ class MotionCollectOverlap(Node):
             ticks += 1
             if start_z is not None and streak == 0 and ticks % 50 == 0:  # ~10 Hz
                 now = self.lookup('world')
-                if now and start_z - now['translation']['z'] > self.max_descent_m:
-                    self.stop()
-                    return 'no_contact'
+                if now:
+                    z = now['translation']['z']
+                    if start_z - z > self.max_descent_m:
+                        self.stop()
+                        return 'no_contact'
+                    if abs(z - last_z) > 0.0002:
+                        last_z, last_move_t = z, time.time()
+                    elif time.time() - last_move_t > self.stall_s:
+                        self.stop()
+                        raise RuntimeError(
+                            f"tooltip hasn't moved in {self.stall_s:.0f} s of descent "
+                            f"(z={z:.4f} m, {(start_z - z) * 1000:.2f} mm below start, "
+                            f"F={self.force:.2f} N); MoveIt Servo is not executing the twist. "
+                            f"Check `ros2 topic echo /{self.ns}/servo_node/status`."
+                        )
             time.sleep(0.002)
 
     def touch_and_capture(
@@ -325,11 +370,12 @@ class MotionCollectOverlap(Node):
                 f"F={force_at_stop:.2f} N"
             )
 
-        time.sleep(2.0)
         self.capture_stem = f"gelsight_{capture_index:04d}"
-        self.gelsight_capture_image = True
-        while self.gelsight_capture_image:
-            time.sleep(0.1)
+        if self.use_gelsight:
+            time.sleep(2.0)
+            self.gelsight_capture_image = True
+            while self.gelsight_capture_image:
+                time.sleep(0.1)
 
         # World-frame pose keeps the keys stitch.py reads; the rest is extra.
         pose = dict(contact_world) if contact_world else {}
@@ -351,10 +397,12 @@ class MotionCollectOverlap(Node):
         self.run_action(self.pose_goal_client, goal)
         return {'capture_index': capture_index, 'row': row, 'col': col,
                 'start_unix': t_start, 'duration_s': time.time() - t_start,
-                'attempts': attempt, 'captured': True, 'valid_contact': valid,
+                'attempts': attempt, 'captured': self.use_gelsight, 'valid_contact': valid,
                 'descent_m': descent}
 
     def calibrate_baseline(self) -> None:
+        if not self.use_gelsight:
+            return
         self.get_logger().info("Capturing gelsight baseline frame for calibration...")
         self.gelsight_calibrate = True
         while self.gelsight_calibrate:
@@ -376,6 +424,7 @@ class MotionCollectOverlap(Node):
             'script': 'motion_collect_overlap',
             'overlap': overlap,
             'area_m': list(self.area_m), 'center_m': list(self.center),
+            'plate_m': list(self.plate_m) if self.plate_m else None,
             'fov_m': list(fov), **plan,
             'frame_id': self.frame_id, 'safe_z': self.safe_z,
             'force_max': self.force_max, 'min_descent_m': self.min_descent_m,
@@ -428,12 +477,14 @@ class MotionCollectOverlap(Node):
             json.dump(records, f, indent=2)
         self.get_logger().info(
             f"[overlap {overlap:.2f}] scan took {total / 60:.1f} min "
-            f"({meta['timing']['mean_touch_s']:.1f} s/touch); stitching..."
+            f"({meta['timing']['mean_touch_s']:.1f} s/touch)"
         )
 
-        stitch_session_solved(
-            session_dir=run_dir, touch_x=nx, touch_y=ny, touch_overlap=overlap,
-        )
+        if self.use_gelsight:
+            self.get_logger().info(f"[overlap {overlap:.2f}] stitching...")
+            stitch_session_solved(
+                session_dir=run_dir, touch_x=nx, touch_y=ny, touch_overlap=overlap,
+            )
         return {'overlap': overlap, 'dir': os.path.basename(run_dir),
                 'touches': n, 'grid': [nx, ny], **meta['timing']}
 
@@ -458,6 +509,7 @@ def main(args=None):
         fov = (GELSIGHT_FULL_WIDTH_M * keep, GELSIGHT_FULL_HEIGHT_M * keep)
         sweep = {
             'area_m': list(node.area_m), 'center_m': list(node.center),
+            'plate_m': list(node.plate_m) if node.plate_m else None,
             'overlaps': node.overlaps, 'runs': [],
         }
         for o in node.overlaps:
@@ -473,7 +525,8 @@ def main(args=None):
             with open(sweep_path, 'w') as f:
                 json.dump(sweep, f, indent=2)
 
-        compare_overlap_runs(node.sweep_dir)
+        if node.use_gelsight:
+            compare_overlap_runs(node.sweep_dir)
 
         request = Home.Request()
         request.speed = 0.1
@@ -483,7 +536,8 @@ def main(args=None):
         node.get_logger().info("Script interrupted by user.")
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
         spin_thread.join()
 
 
