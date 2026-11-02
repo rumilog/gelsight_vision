@@ -120,8 +120,9 @@ class MotionCollectOverlap(Node):
         _ = self.declare_parameter('rebaseline_each_run', True)
         # Plate-frame Z the tooltip approaches from before each descent.
         _ = self.declare_parameter('safe_z', 0.02)
-        # Servo twist in m/s (servo command_in_type: speed_units).
-        _ = self.declare_parameter('descent_speed', -0.005)
+        # Servo twist z command; matches motion_collect_sample's touch() dz,
+        # which is known to move the real arm.
+        _ = self.declare_parameter('descent_speed', -0.025)
         # Contact must happen at least this far below the start Z, else the
         # force trip is treated as spurious and the touch retried.
         _ = self.declare_parameter('min_descent_m', 0.001)
@@ -429,7 +430,8 @@ class MotionCollectOverlap(Node):
             'frame_id': self.frame_id, 'safe_z': self.safe_z,
             'force_max': self.force_max, 'min_descent_m': self.min_descent_m,
             'capture_order': 'files row-major: k -> row (k-1)//touch_y, col (k-1)%touch_y; '
-                             'row 0 = max plate x, col 0 = max plate y; touched serpentine',
+                             'row 0 = max plate x, col 0 = max plate y; touched serpentine '
+                             'from (row 0, col touch_y-1) toward +plate y',
         }
         meta_path = os.path.join(run_dir, 'session.json')
         with open(meta_path, 'w') as f:
@@ -449,7 +451,9 @@ class MotionCollectOverlap(Node):
         done = 0
         for row in range(nx):
             x = self.center[0] + ((nx - 1) / 2.0 - row) * sx
-            cols = range(ny) if row % 2 == 0 else range(ny - 1, -1, -1)
+            # Serpentine starting at min plate y so the sweep leaves the
+            # plate-origin edge and heads onto the plate (+y).
+            cols = range(ny - 1, -1, -1) if row % 2 == 0 else range(ny)
             for col in cols:
                 y = self.center[1] + ((ny - 1) / 2.0 - col) * sy
                 k = row * ny + col + 1

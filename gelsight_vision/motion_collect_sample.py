@@ -53,6 +53,9 @@ class MotionCollectSample(Node):
         _ = self.declare_parameter('frame_id', 'plate')
         _ = self.declare_parameter('force_max', 4.0)
         _ = self.declare_parameter('mock', False)
+        # False runs the motion only (no gelsight baseline, captures or
+        # stitching) -- pair with mock:=True to dry-run without sensors.
+        _ = self.declare_parameter('use_gelsight', True)
         _ = self.declare_parameter('touch_x', 1)
         _ = self.declare_parameter('touch_y', 1)
         # Fraction of the cropped gelsight FOV shared by neighbouring touches.
@@ -81,6 +84,7 @@ class MotionCollectSample(Node):
         self.frame_id: str = str(self.get_parameter('frame_id').value)
         self.force_max: float = float(self.get_parameter('force_max').value)
         self.mock: bool = bool(self.get_parameter('mock').value)
+        self.use_gelsight: bool = bool(self.get_parameter('use_gelsight').value)
         self.touch_x: int = int(self.get_parameter('touch_x').value)
         self.touch_y: int = int(self.get_parameter('touch_y').value)
         self.touch_overlap: float = float(self.get_parameter('touch_overlap').value)
@@ -165,12 +169,13 @@ class MotionCollectSample(Node):
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
         # Gelsight Subscriber
-        self.gelsight_subscriber = self.create_subscription(
-            Image,
-            'gelsight_capture/image',
-            self.gelsight_listener_callback,
-            10
-        )
+        if self.use_gelsight:
+            self.gelsight_subscriber = self.create_subscription(
+                Image,
+                'gelsight_capture/image',
+                self.gelsight_listener_callback,
+                10
+            )
 
         # D555 Subscriber
         self.d555_subscriber = self.create_subscription(
@@ -736,11 +741,14 @@ def main(args=None):
     try:
         # Capture an untouched-gel frame to calibrate the HeightMapper baseline.
         # Still useful to have on hand even though we're not touching yet.
-        node.get_logger().info("Capturing gelsight baseline frame for calibration...")
-        node.gelsight_calibrate = True
-        while node.gelsight_calibrate:
-            time.sleep(0.1)
-        node.get_logger().info("Gelsight baseline captured and calibrated.")
+        if node.use_gelsight:
+            node.get_logger().info("Capturing gelsight baseline frame for calibration...")
+            node.gelsight_calibrate = True
+            while node.gelsight_calibrate:
+                time.sleep(0.1)
+            node.get_logger().info("Gelsight baseline captured and calibrated.")
+        else:
+            node.get_logger().info("use_gelsight:=False -- skipping gelsight baseline.")
 
         # Send request to home robot arm
         request = Home.Request()
@@ -805,46 +813,48 @@ def main(args=None):
                     node=node,
                     frame_id=node.frame_id,
                     mock=node.mock,
+                    capture=node.use_gelsight,
                     position=Point(x=x, y=y, z=0.02),
                     orientation=orientation,
                 )
 
-        node.get_logger().info("Stitching session captures...")
-        stitch_session(
-            session_dir=node.capture_dir,
-            touch_x=node.touch_x,
-            touch_y=node.touch_y,
-        )
-        write_stitched_ply(
-            session_dir=node.capture_dir,
-            touch_x=node.touch_x,
-            touch_y=node.touch_y,
-        )
-        # Plate-frame anchored stitch — uses per-touch pose JSONs to place
-        # each detrended tile at its measured contact-Z. No-op if pose JSONs
-        # aren't present (silent for backward compat, warning printed).
-        stitch_session_anchored(
-            session_dir=node.capture_dir,
-            touch_x=node.touch_x,
-            touch_y=node.touch_y,
-        )
-        write_anchored_ply(
-            session_dir=node.capture_dir,
-            touch_x=node.touch_x,
-            touch_y=node.touch_y,
-        )
-        # Per-tile Z offsets solved from tile overlaps/seams, with contact Z
-        # as a robust weak prior. Writes gelsight_solved_* (depth, RGB, views, PLY).
-        stitch_session_solved(
-            session_dir=node.capture_dir,
-            touch_x=node.touch_x,
-            touch_y=node.touch_y,
-            touch_overlap=node.touch_overlap,
-        )
-        # Transform the stereo PLY into world coords and combine with the
-        # anchored gelsight PLY. Uses camera_focus pose as camera-frame proxy
-        # (see align_clouds.py). No-op if stereo pose JSON is missing.
-        write_combined_ply(session_dir=node.capture_dir)
+        if node.use_gelsight:
+            node.get_logger().info("Stitching session captures...")
+            stitch_session(
+                session_dir=node.capture_dir,
+                touch_x=node.touch_x,
+                touch_y=node.touch_y,
+            )
+            write_stitched_ply(
+                session_dir=node.capture_dir,
+                touch_x=node.touch_x,
+                touch_y=node.touch_y,
+            )
+            # Plate-frame anchored stitch — uses per-touch pose JSONs to place
+            # each detrended tile at its measured contact-Z. No-op if pose JSONs
+            # aren't present (silent for backward compat, warning printed).
+            stitch_session_anchored(
+                session_dir=node.capture_dir,
+                touch_x=node.touch_x,
+                touch_y=node.touch_y,
+            )
+            write_anchored_ply(
+                session_dir=node.capture_dir,
+                touch_x=node.touch_x,
+                touch_y=node.touch_y,
+            )
+            # Per-tile Z offsets solved from tile overlaps/seams, with contact Z
+            # as a robust weak prior. Writes gelsight_solved_* (depth, RGB, views, PLY).
+            stitch_session_solved(
+                session_dir=node.capture_dir,
+                touch_x=node.touch_x,
+                touch_y=node.touch_y,
+                touch_overlap=node.touch_overlap,
+            )
+            # Transform the stereo PLY into world coords and combine with the
+            # anchored gelsight PLY. Uses camera_focus pose as camera-frame proxy
+            # (see align_clouds.py). No-op if stereo pose JSON is missing.
+            write_combined_ply(session_dir=node.capture_dir)
 
         # Return camera_focus + home the arm.
         _ = node.get_logger().info("Moving Camera Focus")

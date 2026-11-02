@@ -19,12 +19,13 @@ class SetPlate(Node):
         t.header.stamp = self.get_clock().now().to_msg()
         t.header.frame_id = "world"
         t.child_frame_id = self.frame_id
-        t.transform.translation.x = 0.075 # 37.5 cm
-        t.transform.translation.y = 0.0 # -27.5 cm
+        # Plate corner sits at world (0, 0); the 150 x 150 mm plate extends
+        # along world +x / +y, so plate axes = world axes.
+        t.transform.translation.x = 0.0
+        t.transform.translation.y = 0.0
+        # t.transform.translation.x = 0.075 # 7.5 cm
         # t.transform.translation.x = 0.325 # 32.5 cm
         # t.transform.translation.y = -0.025 # -2.5 cm
-        # t.transform.translation.x = 0.0
-        # t.transform.translation.y = -0.0
         t.transform.translation.z = 0.0
         q = quaternion_from_euler(math.radians(0.0), math.radians(0.0), math.radians(0.0))
         t.transform.rotation = Quaternion(x=q[0], y=q[1], z=q[2], w=q[3])

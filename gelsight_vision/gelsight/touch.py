@@ -14,6 +14,7 @@ def touch(
     orientation: Quaternion,
     dz: float = -0.025,
     force_max: float = 4.0,
+    capture: bool = True,
 ):
     gelsight_goal_msg = PoseGoal.Goal()
     gelsight_goal_msg.target_pose = Pose(position=position, orientation=orientation)
@@ -41,6 +42,7 @@ def touch(
             node.move_z(dz)
             print(node.force)
             if node.force >= force_max:
+                print("Stopped!")
                 node.stop()
                 break
             time.sleep(0.002)
@@ -53,10 +55,11 @@ def touch(
     time.sleep(2.0)
 
     # Gelsight picture take
-    node.gelsight_capture_image = True
+    if capture:
+        node.gelsight_capture_image = True
 
-    while node.gelsight_capture_image:
-        time.sleep(0.1)
+        while node.gelsight_capture_image:
+            time.sleep(0.1)
 
     # Wait for pose aiction server to be available.
     time.sleep(0.1)
