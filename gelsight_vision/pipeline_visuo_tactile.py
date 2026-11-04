@@ -93,7 +93,7 @@ class PipelineVisuoTactile(Node):
         # Gelsight Subscriber (baseline calibration + per-touch capture).
         self.gelsight_subscriber = self.create_subscription(
             Image,
-            'gelsight_capture/image',
+            'tool_side_gelsight/image_raw',
             self.gelsight_listener_callback,
             10
         )
@@ -101,7 +101,7 @@ class PipelineVisuoTactile(Node):
         # D555 RGB Subscriber
         self.d555_subscriber = self.create_subscription(
             Image,
-            'gelsight_vision_d555/color/image_raw',
+            'tool_side_cam/color/image_raw',
             self.d555_listener_callback,
             10
         )

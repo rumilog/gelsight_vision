@@ -51,7 +51,9 @@ class MotionCollectSample(Node):
         # Assigns namespace to ur20
         _ = self.declare_parameter('ns', 'ur20')
         _ = self.declare_parameter('frame_id', 'plate')
-        _ = self.declare_parameter('force_max', 4.0)
+        _ = self.declare_parameter('force_max', 3.0)
+        # Servo twist z in m/s for the touch descent (speed_units).
+        _ = self.declare_parameter('descent_speed', -0.020)
         _ = self.declare_parameter('mock', False)
         # False runs the motion only (no gelsight baseline, captures or
         # stitching) -- pair with mock:=True to dry-run without sensors.
@@ -83,6 +85,7 @@ class MotionCollectSample(Node):
         self.ns: str = str(self.get_parameter('ns').value)
         self.frame_id: str = str(self.get_parameter('frame_id').value)
         self.force_max: float = float(self.get_parameter('force_max').value)
+        self.descent_speed: float = float(self.get_parameter('descent_speed').value)
         self.mock: bool = bool(self.get_parameter('mock').value)
         self.use_gelsight: bool = bool(self.get_parameter('use_gelsight').value)
         self.touch_x: int = int(self.get_parameter('touch_x').value)
@@ -172,7 +175,7 @@ class MotionCollectSample(Node):
         if self.use_gelsight:
             self.gelsight_subscriber = self.create_subscription(
                 Image,
-                'gelsight_capture/image',
+                'tool_side_gelsight/image_raw',
                 self.gelsight_listener_callback,
                 10
             )
@@ -180,7 +183,7 @@ class MotionCollectSample(Node):
         # D555 Subscriber
         self.d555_subscriber = self.create_subscription(
             Image,
-            'gelsight_vision_d555/color/image_raw',
+            'tool_side_cam/color/image_raw',
             self.d555_listener_callback,
             10
         )
@@ -189,7 +192,7 @@ class MotionCollectSample(Node):
         # alongside the color image when the capture trigger fires).
         self.d555_depth_subscriber = self.create_subscription(
             Image,
-            'gelsight_vision_d555/depth/image_rect_raw',
+            'tool_side_cam/depth/image_rect_raw',
             self.d555_depth_listener_callback,
             10
         )
@@ -199,13 +202,13 @@ class MotionCollectSample(Node):
         # 8-bit grayscale on infra1/infra2/image_rect_raw.
         self.infra1_subscriber = self.create_subscription(
             Image,
-            'gelsight_vision_d555/infra1/image_rect_raw',
+            'tool_side_cam/infra1/image_rect_raw',
             self.infra1_listener_callback,
             10,
         )
         self.infra2_subscriber = self.create_subscription(
             Image,
-            'gelsight_vision_d555/infra2/image_rect_raw',
+            'tool_side_cam/infra2/image_rect_raw',
             self.infra2_listener_callback,
             10,
         )
@@ -213,7 +216,7 @@ class MotionCollectSample(Node):
         # turn IGEV disparity into metric depth without re-scaling.
         self.infra_info_subscriber = self.create_subscription(
             CameraInfo,
-            'gelsight_vision_d555/infra1/camera_info',
+            'tool_side_cam/infra1/camera_info',
             self.infra_info_callback,
             10,
         )
@@ -816,6 +819,8 @@ def main(args=None):
                     capture=node.use_gelsight,
                     position=Point(x=x, y=y, z=0.02),
                     orientation=orientation,
+                    dz=node.descent_speed,
+                    force_max=node.force_max,
                 )
 
         if node.use_gelsight:

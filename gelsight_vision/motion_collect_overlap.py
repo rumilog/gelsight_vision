@@ -20,6 +20,12 @@ Session layout (per-touch files match motion_collect_sample.py):
             gelsight_NNNN.png, _raw.png, _depth.npy, _depth_preview.png, _pose.json
             gelsight_solved_*          (stitch_session_solved)
         overlap_0.25/ ...
+        realsense/                     one RealSense snapshot of the area, taken
+                                       before the touches (use_realsense:=True)
+            color.png, infra1.png, infra2.png
+            depth_raw.png (16-bit device units), depth_m.npy, depth_preview.png
+            camera_info.json           intrinsics per stream
+            pose.json                  camera_focus in world + plate frames
 
 Each `_pose.json` holds the gelsight_tooltip pose at the force-stop instant in
 world (the keys stitch.py reads) and plate frames, plus the commanded target,
@@ -28,7 +34,12 @@ A touch whose force trips before `min_descent_m` of travel is retried.
 
 Touches run in serpentine order to cut travel; files are still numbered
 row-major (k -> row (k-1)//touch_y, col (k-1)%touch_y) so the stitcher's grid
-mapping holds. Tactile-only: no D555 / IGEV.
+mapping holds.
+
+Before the touches, camera_focus is moved `standoff_z` above the area centre
+and one RealSense set (color, depth, IR pair) is saved under `realsense/`; no
+IGEV is run here. Missing streams are warned about and skipped, never waited
+on forever. `use_realsense:=False` skips the move and the capture.
 
 `use_gelsight:=False` runs the motion only (no baseline, captures, stitch or
 comparison) -- pair with `mock:=True` to dry-run the sweep on mock hardware.
@@ -61,9 +72,10 @@ from cv_bridge import CvBridge
 from geometry_msgs.msg import Point, Pose, Quaternion
 from rclpy.action.client import ActionClient
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 from robot_manager_interfaces.action import PoseGoal
 from robot_manager_interfaces.srv import Home
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import CameraInfo, Image
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
 from tf_transformations import quaternion_from_euler
@@ -100,10 +112,18 @@ class MotionCollectOverlap(Node):
 
         _ = self.declare_parameter('ns', 'ur20')
         _ = self.declare_parameter('frame_id', 'plate')
-        _ = self.declare_parameter('force_max', 4.0)
+        _ = self.declare_parameter('force_max', 3.0)
         _ = self.declare_parameter('mock', False)
         # False: motion-only dry run -- no gelsight subscription, captures or stitching.
         _ = self.declare_parameter('use_gelsight', True)
+        _ = self.declare_parameter('gelsight_topic', '/tool_side_gelsight/image_raw')
+        # One RealSense snapshot of the area from camera_focus at standoff_z
+        # (plate frame, m) before the touches; topics live under realsense_ns.
+        _ = self.declare_parameter('use_realsense', True)
+        _ = self.declare_parameter('realsense_ns', '/tool_side_cam')
+        _ = self.declare_parameter('standoff_z', 0.30)
+        _ = self.declare_parameter('realsense_depth_scale', 0.001)
+        _ = self.declare_parameter('realsense_timeout_s', 5.0)
         # Plate area to scan (mm) and its centre in the plate frame (m).
         _ = self.declare_parameter('area_x_mm', 30.0)
         _ = self.declare_parameter('area_y_mm', 30.0)
@@ -120,9 +140,8 @@ class MotionCollectOverlap(Node):
         _ = self.declare_parameter('rebaseline_each_run', True)
         # Plate-frame Z the tooltip approaches from before each descent.
         _ = self.declare_parameter('safe_z', 0.02)
-        # Servo twist z command; matches motion_collect_sample's touch() dz,
-        # which is known to move the real arm.
-        _ = self.declare_parameter('descent_speed', -0.025)
+        # Servo twist z in m/s (servo command_in_type: speed_units).
+        _ = self.declare_parameter('descent_speed', -0.020)
         # Contact must happen at least this far below the start Z, else the
         # force trip is treated as spurious and the touch retried.
         _ = self.declare_parameter('min_descent_m', 0.001)
@@ -145,6 +164,14 @@ class MotionCollectOverlap(Node):
         self.force_max: float = float(self.get_parameter('force_max').value)
         self.mock: bool = bool(self.get_parameter('mock').value)
         self.use_gelsight: bool = bool(self.get_parameter('use_gelsight').value)
+        self.gelsight_topic: str = str(self.get_parameter('gelsight_topic').value)
+        self.use_realsense: bool = bool(self.get_parameter('use_realsense').value)
+        self.realsense_ns: str = str(self.get_parameter('realsense_ns').value).rstrip('/')
+        self.standoff_z: float = float(self.get_parameter('standoff_z').value)
+        self.realsense_depth_scale: float = float(
+            self.get_parameter('realsense_depth_scale').value
+        )
+        self.realsense_timeout_s: float = float(self.get_parameter('realsense_timeout_s').value)
         self.area_m = (
             float(self.get_parameter('area_x_mm').value) / 1000.0,
             float(self.get_parameter('area_y_mm').value) / 1000.0,
@@ -209,8 +236,12 @@ class MotionCollectOverlap(Node):
 
         if self.use_gelsight:
             self.gelsight_subscriber = self.create_subscription(
-                Image, 'gelsight_capture/image', self.gelsight_listener_callback, 10,
+                Image, self.gelsight_topic, self.gelsight_listener_callback, 10,
             )
+
+        # RealSense streams are subscribed only inside capture_realsense(),
+        # one at a time (see there).
+        self.rs_latest: dict = {}
 
     #### Gelsight
     def gelsight_listener_callback(self, msg):
@@ -401,6 +432,133 @@ class MotionCollectOverlap(Node):
                 'attempts': attempt, 'captured': self.use_gelsight, 'valid_contact': valid,
                 'descent_m': descent}
 
+    #### RealSense
+    def _rs_latch(self, key: str):
+        # Single-arg callback: rclpy passes MessageInfo to 2-arg callables,
+        # so a `lambda msg, k=key` default would be overwritten.
+        def _cb(msg):
+            self.rs_latest[key] = msg
+        return _cb
+
+    def _rs_group_done(self, group) -> bool:
+        """True once every stream in `group` has a message; for the IR pair
+        their header stamps must also match."""
+        msgs = [self.rs_latest.get(key) for key, _, _ in group]
+        if any(m is None for m in msgs):
+            return False
+        stamps = {(m.header.stamp.sec, m.header.stamp.nanosec) for m in msgs}
+        return len(stamps) == 1
+
+    def capture_realsense(self, orientation: Quaternion) -> None:
+        """Move camera_focus `standoff_z` above the area centre and save one
+        color / depth / IR-pair set plus intrinsics and pose to `realsense/`."""
+        if not self.use_realsense:
+            return
+        out_dir = os.path.join(self.sweep_dir, 'realsense')
+        os.makedirs(out_dir, exist_ok=True)
+
+        goal = PoseGoal.Goal()
+        goal.target_pose = Pose(
+            position=Point(x=self.center[0], y=self.center[1], z=self.standoff_z),
+            orientation=orientation,
+        )
+        goal.velocity_scaling = 0.1
+        goal.acceleration_scaling = 0.1
+        goal.frame_id = self.frame_id
+        goal.target_id = "camera_focus"
+        goal.method = "PTP"
+        self.get_logger().info(
+            f"RealSense: moving camera_focus to plate ({self.center[0]:.3f}, "
+            f"{self.center[1]:.3f}, {self.standoff_z:.3f})..."
+        )
+        self.run_action(self.pose_goal_client, goal)
+
+        # Let the arm settle and auto-exposure catch up.
+        time.sleep(2.0)
+
+        # Subscribe to one stream at a time, take its first message, then drop
+        # the subscription. Holding all four raw 1280x720 streams (~100 MB/s
+        # from the camera PC) alongside the gelsight stream stalled every
+        # stream on the link, including the gelsight baseline.
+        # The IR pair is the exception: both are taken together so the saved
+        # infra1/infra2 come from the same exposure (matching stamps).
+        self.rs_latest.clear()
+        wanted = ('color', 'depth', 'infra1', 'infra2')
+        for group in (
+            (('color', Image, 'color/image_raw'),),
+            (('depth', Image, 'depth/image_rect_raw'),),
+            (('infra1', Image, 'infra1/image_rect_raw'),
+             ('infra2', Image, 'infra2/image_rect_raw')),
+            (('color_info', CameraInfo, 'color/camera_info'),),
+            (('depth_info', CameraInfo, 'depth/camera_info'),),
+            (('infra1_info', CameraInfo, 'infra1/camera_info'),),
+        ):
+            subs = [
+                self.create_subscription(
+                    typ, f"{self.realsense_ns}/{suffix}", self._rs_latch(key),
+                    qos_profile_sensor_data if typ is Image else 10,
+                )
+                for key, typ, suffix in group
+            ]
+            deadline = time.time() + self.realsense_timeout_s
+            while time.time() < deadline and not self._rs_group_done(group):
+                time.sleep(0.02)
+            for sub in subs:
+                self.destroy_subscription(sub)
+        got = dict(self.rs_latest)
+        missing = [k for k in wanted if k not in got]
+        if missing:
+            self.get_logger().warn(
+                f"RealSense: no {', '.join(missing)} within {self.realsense_timeout_s:.0f} s "
+                f"each on {self.realsense_ns}/*; saving what arrived"
+            )
+
+        if 'color' in got:
+            cv2.imwrite(os.path.join(out_dir, 'color.png'),
+                        self.cv_bridge.imgmsg_to_cv2(got['color'], desired_encoding='bgr8'))
+        for k in ('infra1', 'infra2'):
+            if k in got:
+                cv2.imwrite(os.path.join(out_dir, f'{k}.png'),
+                            self.cv_bridge.imgmsg_to_cv2(got[k], desired_encoding='mono8'))
+        if 'depth' in got:
+            raw = self.cv_bridge.imgmsg_to_cv2(got['depth'], desired_encoding='16UC1')
+            cv2.imwrite(os.path.join(out_dir, 'depth_raw.png'), raw)
+            depth_m = raw.astype(np.float32) * self.realsense_depth_scale
+            depth_m[raw == 0] = np.nan
+            np.save(os.path.join(out_dir, 'depth_m.npy'), depth_m)
+            valid = raw[raw > 0]
+            if valid.size:
+                lo, hi = np.percentile(valid, (2, 98))
+                norm = np.clip((raw.astype(np.float32) - lo) / max(hi - lo, 1.0), 0, 1)
+                preview = cv2.applyColorMap((norm * 255).astype(np.uint8), cv2.COLORMAP_TURBO)
+                preview[raw == 0] = 0
+                cv2.imwrite(os.path.join(out_dir, 'depth_preview.png'), preview)
+
+        info = {}
+        for k in ('color_info', 'depth_info', 'infra1_info'):
+            m = got.get(k)
+            if m is not None:
+                info[k.removesuffix('_info')] = {
+                    'frame_id': m.header.frame_id, 'width': m.width, 'height': m.height,
+                    'fx': m.k[0], 'fy': m.k[4], 'cx': m.k[2], 'cy': m.k[5],
+                    'distortion_model': m.distortion_model, 'd': list(m.d),
+                }
+        info['depth_scale_m'] = self.realsense_depth_scale
+        with open(os.path.join(out_dir, 'camera_info.json'), 'w') as f:
+            json.dump(info, f, indent=2)
+
+        pose = {
+            'target_plate_m': {'x': self.center[0], 'y': self.center[1], 'z': self.standoff_z},
+            'camera_focus_world': self.lookup('world', 'camera_focus'),
+            'camera_focus_plate': self.lookup(self.frame_id, 'camera_focus'),
+            'stamps': {k: {'sec': m.header.stamp.sec, 'nanosec': m.header.stamp.nanosec}
+                       for k, m in got.items()},
+        }
+        with open(os.path.join(out_dir, 'pose.json'), 'w') as f:
+            json.dump(pose, f, indent=2)
+        saved = [k for k in wanted if k in got]
+        self.get_logger().info(f"RealSense: saved {', '.join(saved) or 'nothing'} -> {out_dir}")
+
     def calibrate_baseline(self) -> None:
         if not self.use_gelsight:
             return
@@ -508,6 +666,9 @@ def main(args=None):
 
         q = quaternion_from_euler(radians(0.0), radians(0.0), radians(0.0))
         orientation = Quaternion(x=q[0], y=q[1], z=q[2], w=q[3])
+
+        # RealSense snapshot first, so the arm isn't in the camera's view.
+        node.capture_realsense(orientation)
 
         keep = node.height_mapper.keep_fraction
         fov = (GELSIGHT_FULL_WIDTH_M * keep, GELSIGHT_FULL_HEIGHT_M * keep)
