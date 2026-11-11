@@ -640,11 +640,11 @@ def stitch_session_solved(
     touch_y: int,
     *,
     touch_overlap: float = 0.0,
-    gelsight_full_width_m: float = 0.020,
+    gelsight_full_width_m: float = 0.0199,
     gelsight_full_height_m: float = 0.015,
     border_fraction: float = 0.25,
     height_mm_per_unit: Optional[float] = None,
-    gel_depth_sign: int = 1,
+    gel_depth_sign: int = -1,
     outlier_mm: float = 1.0,
     debias: bool = True,
     min_overlap_px: int = 8,
@@ -700,7 +700,18 @@ def stitch_session_solved(
     neighbours agree best, and falls back to 'none' without overlap.
 
     gsrobotics' Poisson heights are in lateral-pixel units, so the default
-    `height_mm_per_unit` is the tile's mm/px (10 mm / 320 px = 0.03125).
+    `height_mm_per_unit` is the tile's mm/px (about 0.031 at 320 px across a
+    50% crop). Tiles must have square pixels: the scale comes from the long
+    side only, and the lattice step from the poses, so a frame that was
+    squashed to 4:3 gets stretched and "overlaps" strips that are different
+    places on the part (HeightMapper(preserve_aspect=True) avoids that).
+
+    `gel_depth_sign` is -1 because the gsrobotics depth is negative where the
+    surface pushes into the gel: on the 2026-11-04 weld plate +1 turned the
+    raised bead into a valley, and -1 agrees with the robot contact heights.
+    `gelsight_full_width_m` is the long side of the streamed frame, measured
+    as 19.9 mm by registering neighbouring raw frames against the robot step
+    (the 16:9 frame is 19.9 x 11.2 mm, not 20 x 15).
 
     Writes `gelsight_solved_*` next to the captures (depth npy + previews,
     RGB mosaic, shaded relief, overlays, before/after comparison, PLY, and a

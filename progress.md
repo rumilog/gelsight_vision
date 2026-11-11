@@ -29,6 +29,35 @@ hf upload rlogh/gelsight-overlap-scans <session> <session> --repo-type dataset
 
 Then add a row to the Sessions table in the dataset README and in the table above.
 
+3D viewer for the stitched scan (browser, three.js; needs internet for the CDN):
+
+```bash
+python3 -m gelsight_vision.tools.scan_viewer.export_scan_viewer \
+    ~/HuggingFace/Datasets/gelsight-overlap-scans/<session>/overlap_0.25 --serve
+```
+
+This writes `<run>/viewer/` (heights, texture, meta, `index.html`) and opens http://127.0.0.1:8765/. `--stride 2` gives a finer mesh (0.0625 mm, ~4.5M vertices). Add `--skip-export` to re-serve an existing export. The viewer has orbit and fly (WASD) navigation, height exaggeration, RGB / height / high-pass detail / clay shading, a movable light, and a hover readout plus two-click measuring in plate-frame mm.
+
+### Reconstruction fixes (2026-11-11)
+
+The `2026-11-04_17-34-24` stitch showed the weld bead as a valley. Three separate causes, all fixed in code:
+
+1. **Frame size.** The GelSight stream is 16:9 and covers 19.9 x 11.2 mm (measured by registering neighbouring raw frames against the robot step), not 20 x 15 mm. With the central 50% crop the tiles were 9.9 x 5.6 mm, so the 5.625 mm step across the weld left **no overlap in y**; the stitcher stretched each tile by 4/3 and matched strips that were different places on the plate. `GELSIGHT_FULL_HEIGHT_M` is now 0.0112, and the collector uses `HeightMapper(preserve_aspect=True)` (square pixels, 320 x 180 tiles), so a 25% overlap scan really overlaps 25% on both axes.
+2. **Depth sign.** gsrobotics depth is negative where the surface pushes into the gel. `stitch_session_solved` now defaults to `gel_depth_sign=-1`.
+3. **Contact Z.** The tooltip TF only updates at 10 Hz, and the pose was read the instant the descent stopped, so contact Z was wherever the arm was up to 0.1 s earlier (a 1.7 mm sawtooth in visit order). The collector now reads the pose after the arm has been at rest (`pose_at_stop` keeps the old reading). In the 2026-11-04 session contact Z is not usable per touch.
+
+Rebuild an old scan from its raw frames (wider crop, true scale, corrected sign) and re-stitch:
+
+```bash
+python3 -m gelsight_vision.tools.reprocess_overlap_scan \
+    ~/HuggingFace/Datasets/gelsight-overlap-scans/<session>/overlap_0.25
+# -> <session>/overlap_0.25_reprocessed/  (14.9 x 8.4 mm tiles, 50% x 33% overlap)
+```
+
+Result for `2026-11-04_17-34-24`: plate flat to 0.085 mm RMS with both sides level, bead a continuous ridge 0.6-1.3 mm high (median 0.8) and 7-9 mm wide. The reprocessed run is local only; the Hugging Face copy still has the old `gelsight_solved_*` files.
+
+Still open: the top of the bead reads flat with slightly raised edges rather than crowned. Where the pad rests on the bead the gel does not reach the plate beside it, and a region the gel is not touching reads up to ~0.45 mm off, which is the size of that edge/centre difference, so this scan cannot settle the bead-top shape or its absolute height. A rescan with the fixes above gives real overlap and a usable contact Z per touch to anchor it.
+
 The older tactile + D555 dataset, `ppak10/Gelsight-Welds` (local clone at `~/HuggingFace/Datasets/Gelsight-Welds`, layout `source/v1`, `source/v2`), is separate. Its build scripts only understand the older `captures/` layout.
 
 ## Rig setup (as of 2026-11-04)

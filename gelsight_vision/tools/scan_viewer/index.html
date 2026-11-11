@@ -1,0 +1,434 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GelSight Scan Viewer</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: rgba(22, 25, 31, 0.92); --line: #2a2f3a;
+    --text: #e6e8ec; --muted: #9aa1ad; --accent: #4fa3ff; --warn: #ffb44f;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font: 13px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; overflow: hidden; }
+  #c { position: fixed; inset: 0; display: block; }
+  .panel { position: fixed; background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 12px 14px; backdrop-filter: blur(6px); }
+  #ui { top: 12px; left: 12px; width: 280px; max-height: calc(100% - 24px); overflow: auto; }
+  #ui h1 { font-size: 14px; margin: 0 0 2px; font-weight: 600; }
+  #ui .sub { color: var(--muted); font-size: 12px; margin-bottom: 10px; }
+  .row { margin: 9px 0; }
+  .row label { display: flex; justify-content: space-between; color: var(--muted); font-size: 12px; margin-bottom: 3px; }
+  .row label b { color: var(--text); font-weight: 500; font-variant-numeric: tabular-nums; }
+  input[type=range] { width: 100%; accent-color: var(--accent); }
+  .seg { display: flex; gap: 4px; flex-wrap: wrap; }
+  .seg button, .btn { flex: 1; background: #1c2029; color: var(--text); border: 1px solid var(--line);
+    border-radius: 6px; padding: 5px 6px; font: inherit; font-size: 12px; cursor: pointer; white-space: nowrap; }
+  .seg button.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .seg button:hover, .btn:hover { border-color: var(--accent); }
+  hr { border: 0; border-top: 1px solid var(--line); margin: 10px 0; }
+  .keys { color: var(--muted); font-size: 11.5px; }
+  .keys kbd { background: #1c2029; border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; font-size: 11px; color: var(--text); }
+  #hud { right: 12px; bottom: 12px; min-width: 220px; font-variant-numeric: tabular-nums; }
+  #hud .k { color: var(--muted); display: inline-block; width: 74px; }
+  #measure { margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--line); display: none; }
+  #loading { position: fixed; inset: 0; display: grid; place-items: center; color: var(--muted); font-size: 14px; }
+  #flyhint { position: fixed; left: 50%; top: 14px; transform: translateX(-50%); display: none;
+    background: var(--panel); border: 1px solid var(--warn); color: var(--warn); border-radius: 8px; padding: 6px 12px; }
+  #cross { position: fixed; left: 50%; top: 50%; width: 14px; height: 14px; margin: -7px 0 0 -7px; display: none; pointer-events: none; }
+  #cross::before, #cross::after { content: ""; position: absolute; background: #fff8; }
+  #cross::before { left: 6px; top: 0; width: 2px; height: 14px; }
+  #cross::after { top: 6px; left: 0; height: 2px; width: 14px; }
+  #toggle { display: none; }
+  @media (max-width: 640px) {
+    #ui { width: calc(100% - 24px); max-height: 55%; }
+    #hud { left: 12px; right: 12px; }
+  }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="loading">Loading scan…</div>
+<div id="flyhint">Fly mode: click the view to look around · <b>WASD</b> move · <b>Space</b>/<b>C</b> up/down · <b>Shift</b> fast · <b>Esc</b> release</div>
+<div id="cross"></div>
+
+<div id="ui" class="panel">
+  <h1>GelSight overlap scan</h1>
+  <div class="sub" id="sub">—</div>
+
+  <div class="row"><label>Navigation</label>
+    <div class="seg" id="navSeg"><button data-v="orbit" class="on">Orbit</button><button data-v="fly">Fly (F)</button></div>
+  </div>
+  <div class="row"><label>Views</label>
+    <div class="seg"><button id="vTop">Top (1)</button><button id="vIso">Iso (2)</button><button id="vSide">Side (3)</button></div>
+  </div>
+  <hr>
+  <div class="row"><label>Height exaggeration <b id="exV">5.0×</b></label>
+    <input id="ex" type="range" min="0" max="1" step="0.001" value="0.5"></div>
+  <div class="row"><label>Surface colour</label>
+    <div class="seg" id="colSeg">
+      <button data-v="rgb" class="on">GelSight RGB</button><button data-v="height">Height</button>
+      <button data-v="detail">Detail</button><button data-v="clay">Clay</button>
+    </div>
+  </div>
+  <div class="row" id="detailRow" style="display:none"><label>Detail scale (high-pass) <b id="dsV">2.0 mm</b></label>
+    <input id="ds" type="range" min="0.25" max="8" step="0.25" value="2"></div>
+  <hr>
+  <div class="row"><label>Light azimuth <b id="azV">135°</b></label>
+    <input id="az" type="range" min="0" max="360" step="1" value="135"></div>
+  <div class="row"><label>Light elevation <b id="elV">35°</b></label>
+    <input id="el" type="range" min="2" max="90" step="1" value="35"></div>
+  <div class="row"><div class="seg">
+    <button id="wire">Wireframe</button><button id="axesBtn" class="on">Plate &amp; axes</button>
+  </div></div>
+  <hr>
+  <div class="keys">
+    <div><b>Orbit:</b> left-drag rotate · right-drag pan · wheel zoom</div>
+    <div><b>Measure:</b> click two points on the surface · <kbd>M</kbd> clear</div>
+    <div><kbd>F</kbd> fly · <kbd>1</kbd>/<kbd>2</kbd>/<kbd>3</kbd> views · <kbd>R</kbd> reset</div>
+    <div style="margin-top:4px">Axes: <span style="color:#ff5d5d">red = plate +x</span>, <span style="color:#5dff8a">green = plate +y</span>, origin = plate corner.</div>
+  </div>
+</div>
+
+<div id="hud" class="panel">
+  <div><span class="k">plate x</span><span id="hx">—</span></div>
+  <div><span class="k">plate y</span><span id="hy">—</span></div>
+  <div><span class="k">height</span><span id="hz">—</span></div>
+  <div id="measure">
+    <div><span class="k">3D dist</span><span id="m3">—</span></div>
+    <div><span class="k">in-plane</span><span id="m2">—</span></div>
+    <div><span class="k">Δ height</span><span id="mh">—</span></div>
+  </div>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
+
+const $ = (id) => document.getElementById(id);
+const fmt = (v, d = 3) => `${v.toFixed(d)} mm`;
+
+// ---------- load ----------
+const meta = await (await fetch('meta.json')).json();
+const heights = new Float32Array(await (await fetch('heights.bin')).arrayBuffer());
+const texture = await new THREE.TextureLoader().loadAsync(meta.texture.file);
+const { rows, cols, stride } = meta;
+const A = meta.pixel_to_plate_mm;          // plate = [x0, r, c] . [1, row, col]
+const hMin = meta.height_min_mm;
+$('sub').textContent = `${meta.session} · ${meta.run} · ${rows}×${cols} @ ${meta.mm_per_sample.toFixed(3)} mm`;
+
+// sample (i, j) -> full-res pixel centre -> plate mm
+const pix = (k) => k * stride + (stride - 1) / 2;
+const plateXY = (i, j) => [A.x[0] + A.x[1] * pix(i) + A.x[2] * pix(j),
+                           A.y[0] + A.y[1] * pix(i) + A.y[2] * pix(j)];
+// inverse: plate mm -> fractional sample (i, j)
+const det = A.x[1] * A.y[2] - A.x[2] * A.y[1];
+function plateToIJ(x, y) {
+  const dx = x - A.x[0], dy = y - A.y[0];
+  const r = ( A.y[2] * dx - A.x[2] * dy) / det;
+  const c = (-A.y[1] * dx + A.x[1] * dy) / det;
+  return [(r - (stride - 1) / 2) / stride, (c - (stride - 1) / 2) / stride];
+}
+function heightAt(fi, fj) {                 // bilinear, NaN outside
+  if (fi < 0 || fj < 0 || fi > rows - 1 || fj > cols - 1) return NaN;
+  const i0 = Math.min(Math.floor(fi), rows - 2), j0 = Math.min(Math.floor(fj), cols - 2);
+  const ti = fi - i0, tj = fj - j0, k = i0 * cols + j0;
+  return (heights[k] * (1 - tj) + heights[k + 1] * tj) * (1 - ti) +
+         (heights[k + cols] * (1 - tj) + heights[k + cols + 1] * tj) * ti;
+}
+
+// Scene frame (Y up): X = plate x, Y = height above min (x exaggeration), Z = -plate y.
+// ---------- geometry ----------
+const n = rows * cols;
+const pos = new Float32Array(n * 3), uv = new Float32Array(n * 2);
+for (let i = 0; i < rows; i++) for (let j = 0; j < cols; j++) {
+  const k = i * cols + j, [x, y] = plateXY(i, j);
+  pos[3 * k] = x; pos[3 * k + 1] = heights[k] - hMin; pos[3 * k + 2] = -y;
+  uv[2 * k] = j / (cols - 1); uv[2 * k + 1] = 1 - i / (rows - 1);
+}
+const idx = new Uint32Array((rows - 1) * (cols - 1) * 6);
+let p = 0;
+for (let i = 0; i < rows - 1; i++) for (let j = 0; j < cols - 1; j++) {
+  const a = i * cols + j, b = a + 1, c = a + cols, d = c + 1;
+  idx[p++] = a; idx[p++] = c; idx[p++] = b; idx[p++] = b; idx[p++] = c; idx[p++] = d;
+}
+const geom = new THREE.BufferGeometry();
+geom.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+geom.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+geom.setIndex(new THREE.BufferAttribute(idx, 1));
+geom.computeVertexNormals();
+// make sure the surface faces +Y
+{ const nm = geom.attributes.normal.array; let s = 0; for (let k = 1; k < nm.length; k += 3 * 97) s += nm[k];
+  if (s < 0) { for (let k = 0; k < idx.length; k += 3) { const t = idx[k + 1]; idx[k + 1] = idx[k + 2]; idx[k + 2] = t; }
+               geom.computeVertexNormals(); } }
+const colors = new Float32Array(n * 3);
+geom.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+// ---------- renderer / scene ----------
+const renderer = new THREE.WebGLRenderer({ canvas: $('c'), antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0f1115);
+const camera = new THREE.PerspectiveCamera(45, 1, 0.05, 5000);
+
+texture.colorSpace = THREE.SRGBColorSpace;
+texture.anisotropy = renderer.capabilities.getMaxAnisotropy();
+texture.generateMipmaps = true;
+
+const uEx = { value: 5 };
+const mat = new THREE.MeshStandardMaterial({ map: texture, roughness: 0.75, metalness: 0.05, side: THREE.DoubleSide });
+mat.onBeforeCompile = (sh) => {
+  sh.uniforms.uEx = uEx;
+  sh.vertexShader = 'uniform float uEx;\n' + sh.vertexShader
+    .replace('#include <beginnormal_vertex>',
+             'vec3 objectNormal = normalize(vec3(normal.x * uEx, normal.y, normal.z * uEx));')
+    .replace('#include <begin_vertex>', 'vec3 transformed = vec3(position.x, position.y * uEx, position.z);');
+};
+const mesh = new THREE.Mesh(geom, mat);
+scene.add(mesh);
+
+scene.add(new THREE.HemisphereLight(0xdfe8ff, 0x2a2622, 0.55));
+const sun = new THREE.DirectionalLight(0xffffff, 2.2);
+scene.add(sun, sun.target);
+
+// plate outline (150 x 150 mm) + axes at the plate corner
+const helpers = new THREE.Group(); scene.add(helpers);
+{
+  const y0 = -0.5, L = 150;
+  const g = new THREE.BufferGeometry().setFromPoints([[0,0],[L,0],[L,L],[0,L],[0,0]].map(([x, y]) => new THREE.Vector3(x, y0, -y)));
+  helpers.add(new THREE.Line(g, new THREE.LineBasicMaterial({ color: 0x55607a })));
+  const grid = new THREE.GridHelper(L, 15, 0x2c3342, 0x22283a); grid.position.set(L / 2, y0 - 0.01, -L / 2); helpers.add(grid);
+  helpers.add(new THREE.ArrowHelper(new THREE.Vector3(1, 0, 0), new THREE.Vector3(0, y0, 0), 25, 0xff5d5d, 4, 2.5));
+  helpers.add(new THREE.ArrowHelper(new THREE.Vector3(0, 0, -1), new THREE.Vector3(0, y0, 0), 25, 0x5dff8a, 4, 2.5));
+}
+
+// ---------- colour modes ----------
+function turbo(t) {           // polynomial approximation of Google's Turbo colormap
+  t = Math.min(1, Math.max(0, t));
+  const r = 0.13572138 + t * (4.6153926 + t * (-42.66032258 + t * (132.13108234 + t * (-152.94239396 + t * 59.28637943))));
+  const g = 0.09140261 + t * (2.19418839 + t * (4.84296658 + t * (-14.18503333 + t * (4.27729857 + t * 2.82956604))));
+  const b = 0.1066733 + t * (12.64194608 + t * (-60.58204836 + t * (110.36276771 + t * (-89.90310912 + t * 27.34824973))));
+  return [r, g, b].map((v) => Math.pow(Math.min(1, Math.max(0, v)), 2.2)); // to linear
+}
+function paint(values, lo, hi, diverging) {
+  for (let k = 0; k < n; k++) {
+    let t = (values[k] - lo) / (hi - lo);
+    let c;
+    if (diverging) {           // blue - white - red
+      t = Math.min(1, Math.max(0, t)) * 2 - 1; const a = Math.abs(t);
+      c = t < 0 ? [1 - a * 0.85, 1 - a * 0.6, 1] : [1, 1 - a * 0.65, 1 - a * 0.8];
+      c = c.map((v) => Math.pow(v, 2.2));
+    } else c = turbo(t);
+    colors[3 * k] = c[0]; colors[3 * k + 1] = c[1]; colors[3 * k + 2] = c[2];
+  }
+  geom.attributes.color.needsUpdate = true;
+}
+function boxBlur(src, r) {    // separable running-sum box blur, applied twice (~gaussian)
+  const tmp = new Float32Array(n), out = new Float32Array(n);
+  const pass = (a, b, len, cnt, step, lineStep) => {
+    for (let l = 0; l < cnt; l++) {
+      const base = l * lineStep; let s = 0, w = 0;
+      for (let q = 0; q < Math.min(r, len); q++) { s += a[base + q * step]; w++; }
+      for (let q = 0; q < len; q++) {
+        if (q + r < len) { s += a[base + (q + r) * step]; w++; }
+        if (q - r - 1 >= 0) { s -= a[base + (q - r - 1) * step]; w--; }
+        b[base + q * step] = s / w;
+      }
+    }
+  };
+  pass(src, tmp, cols, rows, 1, cols); pass(tmp, out, rows, cols, cols, 1);
+  pass(out, tmp, cols, rows, 1, cols); pass(tmp, out, rows, cols, cols, 1);
+  return out;
+}
+let colorMode = 'rgb';
+function applyColor() {
+  $('detailRow').style.display = colorMode === 'detail' ? '' : 'none';
+  if (colorMode === 'rgb') { mat.map = texture; mat.vertexColors = false; mat.color.set(0xffffff); }
+  else if (colorMode === 'clay') { mat.map = null; mat.vertexColors = false; mat.color.set(0xc9c2b8); }
+  else {
+    mat.map = null; mat.vertexColors = true; mat.color.set(0xffffff);
+    if (colorMode === 'height') paint(heights, meta.height_p1_mm, meta.height_p99_mm, false);
+    else {
+      const r = Math.max(1, Math.round(+$('ds').value / meta.mm_per_sample / 2));
+      const low = boxBlur(heights, r), hp = new Float32Array(n);
+      for (let k = 0; k < n; k++) hp[k] = heights[k] - low[k];
+      const s = hp.slice().sort(); const lim = Math.max(Math.abs(s[Math.floor(n * 0.01)]), Math.abs(s[Math.floor(n * 0.99)]));
+      paint(hp, -lim, lim, true);
+    }
+  }
+  mat.needsUpdate = true;
+}
+
+// ---------- camera presets ----------
+const box = new THREE.Box3().setFromBufferAttribute(geom.attributes.position);
+const ctr = box.getCenter(new THREE.Vector3()), size = box.getSize(new THREE.Vector3());
+const span = Math.max(size.x, size.z);
+const orbit = new OrbitControls(camera, renderer.domElement);
+orbit.enableDamping = true; orbit.dampingFactor = 0.08; orbit.screenSpacePanning = true;
+orbit.maxPolarAngle = Math.PI * 0.98;
+function view(kind) {
+  setNav('orbit');
+  const c = ctr.clone(); c.y = (size.y * uEx.value) / 2; orbit.target.copy(c);
+  if (kind === 'top') camera.position.set(c.x, c.y + span * 1.25, c.z + 0.001);
+  else if (kind === 'side') camera.position.set(c.x, c.y + span * 0.12, c.z + span * 1.15);
+  else camera.position.set(c.x + span * 0.75, c.y + span * 0.95, c.z + span * 1.1);
+  camera.up.set(0, 1, 0); camera.lookAt(c); orbit.update();
+}
+
+// ---------- fly mode ----------
+const fly = new PointerLockControls(camera, document.body);
+let nav = 'orbit';
+const keys = new Set();
+function setNav(v) {
+  if (v === nav) return;
+  nav = v;
+  document.querySelectorAll('#navSeg button').forEach((b) => b.classList.toggle('on', b.dataset.v === v));
+  $('flyhint').style.display = v === 'fly' ? 'block' : 'none';
+  $('cross').style.display = v === 'fly' ? 'block' : 'none';
+  orbit.enabled = v === 'orbit';
+  if (v === 'orbit') {
+    fly.unlock();
+    const dir = camera.getWorldDirection(new THREE.Vector3());
+    const hit = raycastSurface(new THREE.Ray(camera.position.clone(), dir));
+    orbit.target.copy(hit ? hit.p : camera.position.clone().addScaledVector(dir, span * 0.4));
+    orbit.update();
+  }
+}
+renderer.domElement.addEventListener('click', () => { if (nav === 'fly' && !fly.isLocked) fly.lock(); });
+const flyVel = new THREE.Vector3();
+
+// ---------- surface picking (heightfield ray march) ----------
+function surfY(x, z) { const [fi, fj] = plateToIJ(x, -z); const h = heightAt(fi, fj); return [(h - hMin) * uEx.value, h]; }
+function raycastSurface(ray) {
+  const bb = box.clone(); bb.max.y = size.y * uEx.value + 1e-3; bb.min.y = -1e-3;
+  const t0p = ray.intersectBox(bb, new THREE.Vector3()); if (!t0p) return null;
+  let t = Math.max(0, t0p.distanceTo(ray.origin) * (bb.containsPoint(ray.origin) ? 0 : 1));
+  const step = meta.mm_per_sample * 0.5, maxT = t + size.length() * 2 + size.y * uEx.value;
+  const P = new THREE.Vector3(); let prev = null;
+  for (; t < maxT; t += step) {
+    ray.at(t, P); const [sy, h] = surfY(P.x, P.z);
+    if (Number.isNaN(sy)) { if (prev !== null && !bb.containsPoint(P)) break; prev = null; continue; }
+    if (P.y <= sy) {
+      if (prev === null) return { p: P.clone(), h };
+      let lo = prev, hi = t;                           // bisection refine
+      for (let q = 0; q < 20; q++) { const m = (lo + hi) / 2; ray.at(m, P); (P.y <= surfY(P.x, P.z)[0] ? (hi = m) : (lo = m)); }
+      ray.at(hi, P); return { p: P.clone(), h: surfY(P.x, P.z)[1] };
+    }
+    prev = t;
+  }
+  return null;
+}
+const raycaster = new THREE.Raycaster(), mouse = new THREE.Vector2();
+let hoverDirty = false, downAt = null;
+renderer.domElement.addEventListener('pointermove', (e) => {
+  mouse.set((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1); hoverDirty = true;
+});
+function pickAt(m) { raycaster.setFromCamera(m, camera); return raycastSurface(raycaster.ray); }
+function showHover(hit) {
+  if (!hit) { $('hx').textContent = $('hy').textContent = $('hz').textContent = '—'; return; }
+  $('hx').textContent = fmt(hit.p.x, 2); $('hy').textContent = fmt(-hit.p.z, 2); $('hz').textContent = fmt(hit.h, 3);
+}
+
+// ---------- measuring ----------
+const marks = [];  // {x, y, h}
+const markGroup = new THREE.Group(); scene.add(markGroup);
+const markMat = new THREE.MeshBasicMaterial({ color: 0xffb44f, depthTest: false });
+const lineMat = new THREE.LineBasicMaterial({ color: 0xffb44f, depthTest: false });
+function drawMarks() {
+  markGroup.clear();
+  const r = span * 0.004;
+  const pts = marks.map((m) => new THREE.Vector3(m.x, (m.h - hMin) * uEx.value, -m.y));
+  pts.forEach((v) => { const s = new THREE.Mesh(new THREE.SphereGeometry(r, 16, 12), markMat); s.position.copy(v); s.renderOrder = 10; markGroup.add(s); });
+  if (pts.length === 2) { const l = new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), lineMat); l.renderOrder = 10; markGroup.add(l); }
+  $('measure').style.display = marks.length === 2 ? 'block' : 'none';
+  if (marks.length === 2) {
+    const [a, b] = marks, d2 = Math.hypot(a.x - b.x, a.y - b.y), dh = b.h - a.h;
+    $('m3').textContent = fmt(Math.hypot(d2, dh), 3); $('m2').textContent = fmt(d2, 3); $('mh').textContent = fmt(dh, 3);
+  }
+}
+renderer.domElement.addEventListener('pointerdown', (e) => { if (e.button === 0) downAt = [e.clientX, e.clientY]; });
+renderer.domElement.addEventListener('pointerup', (e) => {
+  if (nav !== 'orbit' || e.button !== 0 || !downAt) return;
+  const moved = Math.hypot(e.clientX - downAt[0], e.clientY - downAt[1]); downAt = null;
+  if (moved > 4) return;
+  const hit = pickAt(new THREE.Vector2((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1));
+  if (!hit) return;
+  if (marks.length === 2) marks.length = 0;
+  marks.push({ x: hit.p.x, y: -hit.p.z, h: hit.h }); drawMarks();
+});
+
+// ---------- UI wiring ----------
+const exFromSlider = (s) => Math.pow(10, -0.0 + s * 2) / 2;   // 0.5x .. 50x, log scale
+function setEx() {
+  const old = uEx.value; uEx.value = exFromSlider(+$('ex').value);
+  $('exV').textContent = `${uEx.value < 10 ? uEx.value.toFixed(1) : uEx.value.toFixed(0)}×`;
+  orbit.target.y *= uEx.value / old; drawMarks(); placeSun();
+}
+$('ex').value = Math.log10(5 * 2) / 2; // start at 5x
+$('ex').addEventListener('input', setEx);
+function placeSun() {
+  const az = THREE.MathUtils.degToRad(+$('az').value), el = THREE.MathUtils.degToRad(+$('el').value);
+  $('azV').textContent = `${$('az').value}°`; $('elV').textContent = `${$('el').value}°`;
+  sun.target.position.copy(ctr);
+  sun.position.set(ctr.x + Math.cos(el) * Math.cos(az) * 300, Math.sin(el) * 300, ctr.z - Math.cos(el) * Math.sin(az) * 300);
+}
+$('az').addEventListener('input', placeSun); $('el').addEventListener('input', placeSun);
+document.querySelectorAll('#colSeg button').forEach((b) => b.addEventListener('click', () => {
+  colorMode = b.dataset.v; document.querySelectorAll('#colSeg button').forEach((x) => x.classList.toggle('on', x === b)); applyColor();
+}));
+let dsTimer; $('ds').addEventListener('input', () => {
+  $('dsV').textContent = `${(+$('ds').value).toFixed(2)} mm`; clearTimeout(dsTimer); dsTimer = setTimeout(applyColor, 120);
+});
+$('wire').addEventListener('click', () => { mat.wireframe = !mat.wireframe; $('wire').classList.toggle('on', mat.wireframe); });
+$('axesBtn').addEventListener('click', () => { helpers.visible = !helpers.visible; $('axesBtn').classList.toggle('on', helpers.visible); });
+document.querySelectorAll('#navSeg button').forEach((b) => b.addEventListener('click', () => setNav(b.dataset.v)));
+$('vTop').onclick = () => view('top'); $('vIso').onclick = () => view('iso'); $('vSide').onclick = () => view('side');
+addEventListener('keydown', (e) => {
+  if (e.target.tagName === 'INPUT') return;
+  keys.add(e.code);
+  if (e.code === 'KeyF') setNav(nav === 'fly' ? 'orbit' : 'fly');
+  if (e.code === 'Digit1') view('top'); if (e.code === 'Digit2') view('iso'); if (e.code === 'Digit3') view('side');
+  if (e.code === 'KeyR') view('iso');
+  if (e.code === 'KeyM') { marks.length = 0; drawMarks(); }
+  if (nav === 'fly' && e.code === 'Space') e.preventDefault();
+});
+addEventListener('keyup', (e) => keys.delete(e.code));
+addEventListener('blur', () => keys.clear());
+
+function resize() { renderer.setSize(innerWidth, innerHeight, false); camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); }
+addEventListener('resize', resize);
+
+// ---------- go ----------
+resize(); setEx(); placeSun(); applyColor(); view('iso');
+$('loading').remove();
+window.__viewer = { pickAt, view, setNav, applyColor, setColor: (m) => { colorMode = m; applyColor(); }, marks, drawMarks };
+const clock = new THREE.Clock();
+renderer.setAnimationLoop(() => {
+  const dt = Math.min(clock.getDelta(), 0.05);
+  if (nav === 'fly') {
+    const sp = span * 0.25 * (keys.has('ShiftLeft') || keys.has('ShiftRight') ? 4 : 1);
+    const want = new THREE.Vector3(
+      (keys.has('KeyD') ? 1 : 0) - (keys.has('KeyA') ? 1 : 0),
+      (keys.has('Space') || keys.has('KeyE') ? 1 : 0) - (keys.has('KeyC') || keys.has('KeyQ') ? 1 : 0),
+      (keys.has('KeyW') ? 1 : 0) - (keys.has('KeyS') ? 1 : 0)).multiplyScalar(sp);
+    flyVel.lerp(want, 1 - Math.exp(-dt * 10));
+    fly.moveRight(flyVel.x * dt); fly.moveForward(flyVel.z * dt); camera.position.y += flyVel.y * dt;
+    if (fly.isLocked) { showHover(pickAt(new THREE.Vector2(0, 0))); }
+  } else {
+    orbit.update();
+    if (hoverDirty) { hoverDirty = false; showHover(pickAt(mouse)); }
+  }
+  renderer.render(scene, camera);
+});
+</script>
+</body>
+</html>

@@ -85,10 +85,18 @@ from gelsight_vision.gelsight.height_map import HeightMapper, save_height_previe
 from gelsight_vision.gelsight.stitch import stitch_session_solved
 from gelsight_vision.pipeline import touch_io
 
-# Full-sensor lateral FOV of the gel; the depth pipeline keeps the central
-# `keep_fraction` of each axis (see motion_collect_sample.py).
-GELSIGHT_FULL_WIDTH_M = 0.020
-GELSIGHT_FULL_HEIGHT_M = 0.015
+# Lateral FOV of the streamed GelSight frame; the depth pipeline keeps the
+# central `keep_fraction` of each axis. The driver streams 16:9 (1280x720), and
+# registering neighbouring raw frames of the 2026-11-04 scan against the robot
+# step gives 19.9 x 11.2 mm. The old 20 x 15 mm (a 4:3 figure) made the grid
+# step along the short side equal to the whole tile, so "25% overlap" scans had
+# no overlap in that direction.
+GELSIGHT_FULL_WIDTH_M = 0.0199
+GELSIGHT_FULL_HEIGHT_M = 0.0112
+# The tooltip TF only updates at ~10 Hz, so a lookup the instant the descent
+# stops returns the arm's pose up to 0.1 s (2 mm at 20 mm/s) before the stop.
+# Wait this long with the arm stationary before reading the contact pose.
+CONTACT_POSE_SETTLE_S = 0.5
 
 
 def plan_grid(
@@ -210,7 +218,8 @@ class MotionCollectOverlap(Node):
         # Per-run directory; the gelsight callback writes here.
         self.capture_dir = self.sweep_dir
 
-        self.height_mapper = HeightMapper()
+        # Square pixels: don't squash the 16:9 frame to 4:3 (see HeightMapper).
+        self.height_mapper = HeightMapper(preserve_aspect=True)
         self.cv_bridge = CvBridge()
 
         # Gelsight capture handshake: main thread sets `capture_stem` then the
@@ -403,8 +412,17 @@ class MotionCollectOverlap(Node):
             )
 
         self.capture_stem = f"gelsight_{capture_index:04d}"
+        time.sleep(2.0 if self.use_gelsight else CONTACT_POSE_SETTLE_S)
+        # Contact pose with the arm at rest. The lookups right after the stop
+        # (kept as `pose_at_stop`) are stale by up to one TF period while the
+        # arm is still descending, which put a ~2 mm sawtooth on contact Z.
+        at_stop = {'world': contact_world, 'plate': contact_plate}
+        settled_world, settled_plate = self.lookup('world'), self.lookup(self.frame_id)
+        if settled_world is not None:
+            contact_world, contact_plate = settled_world, settled_plate
+            if start_z is not None:
+                descent = start_z - contact_world['translation']['z']
         if self.use_gelsight:
-            time.sleep(2.0)
             self.gelsight_capture_image = True
             while self.gelsight_capture_image:
                 time.sleep(0.1)
@@ -414,6 +432,7 @@ class MotionCollectOverlap(Node):
         valid = bool(descent is not None and descent >= self.min_descent_m) or self.mock
         pose.update({
             'plate_pose': contact_plate,
+            'pose_at_stop': at_stop,
             'grid': {'capture_index': capture_index, 'row': row, 'col': col},
             'target_plate_m': {'x': x, 'y': y, 'z': self.safe_z},
             'start_z_world_m': start_z,
