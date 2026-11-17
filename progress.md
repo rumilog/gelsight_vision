@@ -12,7 +12,7 @@
 | Session | Area / overlap | Touches | Notes |
 |---|---|---|---|
 | `2026-11-04_17-34-24` | 130 × 135 mm at plate (75, 75) mm, 25% | 408 (17 × 24), all valid | 3.0 N, 20 mm/s; RealSense snapshot in `realsense/` |
-| `2026-11-16_20-15-41` | 130 × 135 mm at plate (75, 75) mm, 50% | 875 (25 × 35), all valid | 3.0 N, 20 mm/s; GelSight only (`use_realsense:=False`, RealSense unplugged), 80 min |
+| `2026-11-16_20-15-41` | 130 × 135 mm at plate (75, 75) mm, 50% | 875 (25 × 35), all valid | 3.0 N, 20 mm/s; GelSight only (`use_realsense:=False`, RealSense unplugged), 80 min. Use `overlap_0.50_reprocessed/` (fixed geometry and sign, includes a `viewer/` export), which is also on HF |
 
 Download:
 
