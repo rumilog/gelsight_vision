@@ -16,6 +16,29 @@ from gelsight_vision.gelsight.height_map import save_height_preview
 _NAME_RE = re.compile(r"^gelsight_(\d{4})\.png$")
 
 
+def _inpaint_untrusted(z: np.ndarray, good: np.ndarray, work_px: int = 1024) -> np.ndarray:
+    """Replace `z` where `good` is False by a smooth fill from the good
+    surface around it. Solved at reduced resolution (cv2 Navier-Stokes
+    inpainting on a uint16-scaled copy keeps it fast), then the fill is
+    upsampled and only written into the bad pixels."""
+    bad = ~good
+    if not bad.any() or not good.any():
+        return z
+    H, W = z.shape
+    s = max(1, int(np.ceil(max(H, W) / work_px)))
+    zs = cv2.resize(np.where(good, z, np.nan).astype(np.float32), (W // s, H // s),
+                    interpolation=cv2.INTER_AREA)
+    gs = np.isfinite(zs)
+    lo = float(np.nanmin(zs))
+    q = np.where(gs, zs - lo, 0).astype(np.float32)
+    fill = cv2.inpaint(q, (~gs).astype(np.uint8), max(3, 8 // s), cv2.INPAINT_NS) + lo
+    fill = cv2.resize(fill, (W, H), interpolation=cv2.INTER_LINEAR)
+    keep_nan = ~np.isfinite(z) & ~cv2.dilate(np.isfinite(z).astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
+    out = np.where(bad, fill, z).astype(np.float32)
+    out[keep_nan] = np.nan  # don't invent data outside the scanned area
+    return out
+
+
 def _fit_plane(depth: np.ndarray, outlier_mm: float = 5.0) -> np.ndarray:
     """Least-squares fit of z = a*u + b*v + c to the depth map, then evaluate.
     Pixels with |z| > outlier_mm are excluded from the fit but the returned
@@ -640,11 +663,11 @@ def stitch_session_solved(
     touch_y: int,
     *,
     touch_overlap: float = 0.0,
-    gelsight_full_width_m: float = 0.020,
+    gelsight_full_width_m: float = 0.0199,
     gelsight_full_height_m: float = 0.015,
     border_fraction: float = 0.25,
     height_mm_per_unit: Optional[float] = None,
-    gel_depth_sign: int = 1,
+    gel_depth_sign: int = -1,
     outlier_mm: float = 1.0,
     debias: bool = True,
     min_overlap_px: int = 8,
@@ -662,6 +685,9 @@ def stitch_session_solved(
     shade_exaggeration: float = 2.0,
     detail_sigma_mm: float = 1.0,
     ply_stride: int = 2,
+    steep_slope: float = 0.0,
+    steep_dilate_mm: float = 0.5,
+    steep_smooth_mm: float = 0.15,
 ) -> Optional[dict]:
     """Stitch the touch grid with per-tile Z offsets solved from tile overlaps.
 
@@ -700,7 +726,28 @@ def stitch_session_solved(
     neighbours agree best, and falls back to 'none' without overlap.
 
     gsrobotics' Poisson heights are in lateral-pixel units, so the default
-    `height_mm_per_unit` is the tile's mm/px (10 mm / 320 px = 0.03125).
+    `height_mm_per_unit` is the tile's mm/px (about 0.031 at 320 px across a
+    50% crop). Tiles must have square pixels: the scale comes from the long
+    side only, and the lattice step from the poses, so a frame that was
+    squashed to 4:3 gets stretched and "overlaps" strips that are different
+    places on the part (HeightMapper(preserve_aspect=True) avoids that).
+
+    `gel_depth_sign` is -1 because the gsrobotics depth is negative where the
+    surface pushes into the gel: on the 2026-11-04 weld plate +1 turned the
+    raised bead into a valley, and -1 agrees with the robot contact heights.
+    `gelsight_full_width_m` is the long side of the streamed frame, measured
+    as 19.9 mm by registering neighbouring raw frames against the robot step
+    (the 16:9 frame is 19.9 x 11.2 mm, not 20 x 15).
+
+    `steep_slope` (mm/mm, 0 = off) distrusts tile pixels whose relief slope
+    exceeds it, plus `steep_dilate_mm` around them. GelSight infers slope
+    from shading, which fails at steep edges such as weld toes: the slope
+    saturates and the gel just past the edge reads the opposite way, so the
+    toe comes out as a spike. Distrusted pixels are left out of the overlap
+    constraints; in the composite any trusted tile covering the same spot
+    wins, and spots no tile reads with trust are inpainted from the trusted
+    surface around them (steep edges become smooth ramps between the
+    trusted heights on either side).
 
     Writes `gelsight_solved_*` next to the captures (depth npy + previews,
     RGB mosaic, shaded relief, overlays, before/after comparison, PLY, and a
@@ -803,6 +850,26 @@ def stitch_session_solved(
         d = np.where(np.abs(d) > outlier_mm, np.nan, d)
         relief[k] = np.ascontiguousarray(d - _fit_plane(d, outlier_mm=outlier_mm)).astype(np.float32)
 
+    # Per-tile trust: False near steep relief (see `steep_slope`).
+    trust: dict[int, np.ndarray] = {}
+    if steep_slope > 0:
+        sig = max(steep_smooth_mm / mm_per_px, 0.5)
+        dil = int(round(steep_dilate_mm / mm_per_px))
+        kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * dil + 1, 2 * dil + 1)) if dil else None
+        for k in ids:
+            d = relief[k]
+            fin = np.isfinite(d)
+            sm = cv2.GaussianBlur(np.where(fin, d, np.nanmedian(d)).astype(np.float32), (0, 0), sig)
+            gy_, gx_ = np.gradient(sm, mm_per_px)
+            steep = (np.hypot(gx_, gy_) > steep_slope).astype(np.uint8)
+            if kern is not None:
+                steep = cv2.dilate(steep, kern)
+            trust[k] = fin & ~steep.astype(bool)
+        frac = 1.0 - np.mean([t.mean() for t in trust.values()])
+        print(f"  steep-slope mask: {frac:.1%} of tile pixels distrusted (> {steep_slope} mm/mm)")
+    # Relief used for the overlap constraints: distrusted pixels -> NaN.
+    relief_fit = {k: np.where(trust[k], relief[k], np.nan) if trust else relief[k] for k in ids}
+
     yy = (np.arange(th) - (th - 1) / 2.0) * mm_per_px  # tile-local mm, rows
     xx = (np.arange(tw) - (tw - 1) / 2.0) * mm_per_px  # tile-local mm, cols
 
@@ -823,7 +890,7 @@ def stitch_session_solved(
             nb = (r + dr) * touch_y + (c + dc) + 1
             if nb not in relief:
                 continue
-            RA, RB = relief[k], relief[nb]
+            RA, RB = relief_fit[k], relief_fit[nb]
             dR = origin[nb][0] - origin[k][0]  # B's origin in A's pixels
             dC = origin[nb][1] - origin[k][1]
             if th - abs(dR) >= min_overlap_px and tw - abs(dC) >= min_overlap_px:
@@ -982,14 +1049,22 @@ def stitch_session_solved(
     def composite(v):
         acc = np.zeros((H, W), np.float64)
         wsum = np.zeros((H, W), np.float64)
+        tsum = np.zeros((H, W), np.float64) if trust else None
         for k in ids:
             r0, c0 = origin[k]
             z = relief[k] + plane_tile(*v[pos[k]])
             m = np.isfinite(z)
-            acc[r0:r0 + th, c0:c0 + tw] += np.where(m, z, 0.0) * feather * m
-            wsum[r0:r0 + th, c0:c0 + tw] += feather * m
+            w = feather * m
+            if trust:  # trusted readings outweigh distrusted ones 1000:1
+                w = w * np.where(trust[k], 1.0, 1e-3)
+                tsum[r0:r0 + th, c0:c0 + tw] += feather * trust[k]
+            acc[r0:r0 + th, c0:c0 + tw] += np.where(m, z, 0.0) * w
+            wsum[r0:r0 + th, c0:c0 + tw] += w
         with np.errstate(invalid='ignore', divide='ignore'):
-            return np.where(wsum > 0, acc / wsum, np.nan).astype(np.float32)
+            out = np.where(wsum > 0, acc / wsum, np.nan).astype(np.float32)
+        if trust:
+            out = _inpaint_untrusted(out, (tsum > 0) & np.isfinite(out))
+        return out
 
     depth_solved = composite(sol)
     depth_naive = composite(naive)
@@ -1081,6 +1156,7 @@ def stitch_session_solved(
         'mm_per_px': mm_per_px, 'height_mm_per_unit': unit_mm,
         'step_px': [row_step_i, col_step_i], 'step_source': step_source,
         'overlap_px': [ov_rows, ov_cols], 'solve_mode': solve_mode,
+        'steep_slope': steep_slope, 'steep_dilate_mm': steep_dilate_mm,
         'n_pairs': len(pairs),
         'orientation': orientation, 'orientation_scores': orient_scores,
         'pair_residual_rms_mm': {'naive': pair_residual_rms(naive), 'solved': pair_residual_rms(sol)},

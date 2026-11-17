@@ -36,7 +36,15 @@ class HeightMapper:
         border_fraction: float = DEFAULT_BORDER_FRACTION,
         marker_threshold: tuple[int, int] = DEFAULT_MARKER_THRESHOLD,
         use_gpu: bool = False,
+        preserve_aspect: bool = False,
     ) -> None:
+        # preserve_aspect: derive the output height from the cropped frame's
+        # aspect ratio instead of forcing `height`. The GelSight Mini driver
+        # streams 16:9 (1280x720, ~19.9 x 11.2 mm); resizing that to 320x240
+        # stretches the short axis by 4/3, so heights integrated from it and
+        # anything stitched from it are distorted. With this on, pixels stay
+        # square (320x180 for a 16:9 frame) and `height` is ignored.
+        self.preserve_aspect = preserve_aspect
         self.width = width
         self.height = height
         self.border_fraction = border_fraction
@@ -53,7 +61,7 @@ class HeightMapper:
         """Set the zero baseline from an untouched-gel image. Subsequent
         height maps are returned relative to this baseline."""
         rgb = self._prepare(baseline_image)
-        self.reconstruction.depth_map_zero = np.zeros((self.height, self.width))
+        self.reconstruction.depth_map_zero = np.zeros(rgb.shape[:2])
         depth, *_ = self.reconstruction.get_depthmap(
             image=rgb, markers_threshold=self.marker_threshold
         )
@@ -91,6 +99,11 @@ class HeightMapper:
                 raise FileNotFoundError(f"Could not read image: {image}")
             image = loaded
         rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        if self.preserve_aspect:
+            cropped = crop_and_resize(image=rgb, target_size=None, border_fraction=self.border_fraction)
+            ch, cw = cropped.shape[:2]
+            self.height = max(1, int(round(self.width * ch / cw)))
+            return cv2.resize(cropped, (self.width, self.height), interpolation=cv2.INTER_AREA)
         return crop_and_resize(
             image=rgb,
             target_size=(self.width, self.height),
