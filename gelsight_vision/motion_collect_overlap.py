@@ -218,6 +218,9 @@ class MotionCollectOverlap(Node):
         self.gelsight_calibrate = False
         self.gelsight_capture_image = False
         self.capture_stem: str | None = None
+        # Arrival time of the newest gelsight frame; a stale value means the
+        # driver has stopped publishing (usually the USB link dropped).
+        self.gelsight_last_frame_t: float = 0.0
 
         self.pose_goal_client: ActionClient = ActionClient(
             self, PoseGoal, self.ns + "/pose_goal",
@@ -242,9 +245,11 @@ class MotionCollectOverlap(Node):
         # RealSense streams are subscribed only inside capture_realsense(),
         # one at a time (see there).
         self.rs_latest: dict = {}
+        self.current_run: dict | None = None
 
     #### Gelsight
     def gelsight_listener_callback(self, msg):
+        self.gelsight_last_frame_t = time.time()
         if self.gelsight_calibrate:
             frame = self.cv_bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
             baseline_path = os.path.join(self.capture_dir, "gelsight_baseline.png")
@@ -360,6 +365,8 @@ class MotionCollectOverlap(Node):
         goal = self.tooltip_goal(x, y, orientation)
         for attempt in range(1, self.max_attempts + 1):
             self.run_action(self.pose_goal_client, goal)
+            # Don't touch down unless the gelsight can capture this contact.
+            self.wait_for_gelsight_stream()
             time.sleep(self.settle_s)
             self.calibrate_sensor()
             start = self.lookup('world')
@@ -406,8 +413,7 @@ class MotionCollectOverlap(Node):
         if self.use_gelsight:
             time.sleep(2.0)
             self.gelsight_capture_image = True
-            while self.gelsight_capture_image:
-                time.sleep(0.1)
+            self._wait_gelsight_flag('gelsight_capture_image')
 
         # World-frame pose keeps the keys stitch.py reads; the rest is extra.
         pose = dict(contact_world) if contact_world else {}
@@ -559,13 +565,81 @@ class MotionCollectOverlap(Node):
         saved = [k for k in wanted if k in got]
         self.get_logger().info(f"RealSense: saved {', '.join(saved) or 'nothing'} -> {out_dir}")
 
+    def stitch_partial(self) -> None:
+        """Stitch the tiles captured so far by a run that stopped early, and
+        mark its session.json as partial. No-op if no run is in progress."""
+        run = getattr(self, 'current_run', None)
+        self.current_run = None
+        if not (self.use_gelsight and run):
+            return
+        n_done = len([
+            p for p in os.listdir(run['dir'])
+            if p.startswith('gelsight_') and p.endswith('_depth.npy')
+            and not p.startswith('gelsight_solved')
+        ])
+        if n_done == 0:
+            print(f"partial stitch: no captures in {run['dir']}; skipping")
+            return
+        meta_path = os.path.join(run['dir'], 'session.json')
+        with open(meta_path) as f:
+            meta = json.load(f)
+        meta['partial'] = {'captured': n_done, 'planned': run['touch_x'] * run['touch_y']}
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2)
+        print(
+            f"partial stitch: {n_done}/{run['touch_x'] * run['touch_y']} tiles in "
+            f"{run['dir']} (Ctrl-C again to skip)..."
+        )
+        stitch_session_solved(
+            session_dir=run['dir'], touch_x=run['touch_x'], touch_y=run['touch_y'],
+            touch_overlap=run['overlap'],
+        )
+
+    def _warn_gelsight_stalled(self, waited_s: float) -> None:
+        self.get_logger().warn(
+            f"No GelSight frames for {waited_s:.0f} s on {self.gelsight_topic}. The "
+            "USB link has probably dropped: reseat the GelSight cable. If frames "
+            "don't come back within a few seconds, restart the GelSight driver on "
+            "the camera PC. Waiting (no timeout)..."
+        )
+
+    def wait_for_gelsight_stream(self) -> None:
+        """Block until gelsight frames are arriving, warning every 10 s.
+        Called with the tooltip above the plate, so a stalled stream never
+        leaves the gel pressed into the sample."""
+        if not self.use_gelsight:
+            return
+        t0 = time.time()
+        next_warn = 1.0
+        while time.time() - self.gelsight_last_frame_t > 1.0:
+            waited = time.time() - t0
+            if waited >= next_warn:
+                self._warn_gelsight_stalled(waited)
+                next_warn = waited + 10.0
+            time.sleep(0.1)
+        if time.time() - t0 > 1.0:
+            self.get_logger().info(f"GelSight frames are back after {time.time() - t0:.0f} s.")
+
+    def _wait_gelsight_flag(self, attr: str) -> None:
+        """Wait for the callback to clear `attr` (a capture request), warning
+        every 10 s while no frames arrive."""
+        t0 = time.time()
+        next_warn = 10.0
+        while getattr(self, attr):
+            waited = time.time() - t0
+            if waited >= next_warn:
+                self._warn_gelsight_stalled(time.time() - max(self.gelsight_last_frame_t, t0))
+                next_warn = waited + 10.0
+            time.sleep(0.1)
+        if time.time() - t0 > 10.0:
+            self.get_logger().info(f"GelSight frame received after {time.time() - t0:.0f} s.")
+
     def calibrate_baseline(self) -> None:
         if not self.use_gelsight:
             return
         self.get_logger().info("Capturing gelsight baseline frame for calibration...")
         self.gelsight_calibrate = True
-        while self.gelsight_calibrate:
-            time.sleep(0.1)
+        self._wait_gelsight_flag('gelsight_calibrate')
 
     def run_scan(self, overlap: float, orientation: Quaternion) -> dict:
         """Scan the area once at `overlap` into its own run directory, stitch
@@ -607,6 +681,8 @@ class MotionCollectOverlap(Node):
         records = []
         t0 = time.time()
         done = 0
+        # Lets main() stitch whatever was captured if the scan stops early.
+        self.current_run = {'dir': run_dir, 'touch_x': nx, 'touch_y': ny, 'overlap': overlap}
         for row in range(nx):
             x = self.center[0] + ((nx - 1) / 2.0 - row) * sx
             # Serpentine starting at min plate y so the sweep leaves the
@@ -623,6 +699,9 @@ class MotionCollectOverlap(Node):
                     f"-> plate ({x:.4f}, {y:.4f}); elapsed {elapsed / 60:.1f} min, eta {eta / 60:.1f} min"
                 )
                 records.append(self.touch_and_capture(k, row, col, x, y, orientation))
+                # Written every touch so an interrupted run keeps its timing.
+                with open(os.path.join(run_dir, 'timing.json'), 'w') as f:
+                    json.dump(records, f, indent=2)
         total = time.time() - t0
 
         durations = [r['duration_s'] for r in records]
@@ -647,6 +726,7 @@ class MotionCollectOverlap(Node):
             stitch_session_solved(
                 session_dir=run_dir, touch_x=nx, touch_y=ny, touch_overlap=overlap,
             )
+        self.current_run = None
         return {'overlap': overlap, 'dir': os.path.basename(run_dir),
                 'touches': n, 'grid': [nx, ny], **meta['timing']}
 
@@ -699,6 +779,11 @@ def main(args=None):
 
     except KeyboardInterrupt:
         node.get_logger().info("Script interrupted by user.")
+        node.stitch_partial()
+    except BaseException:
+        # Stall error, failed move (exit(1)), etc.: keep what was captured.
+        node.stitch_partial()
+        raise
     finally:
         node.destroy_node()
         if rclpy.ok():

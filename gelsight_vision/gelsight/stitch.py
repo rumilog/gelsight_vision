@@ -1128,15 +1128,27 @@ if __name__ == "__main__":
 
     ap = argparse.ArgumentParser(description=stitch_session_solved.__doc__.split("\n")[0])
     ap.add_argument("session_dir")
-    ap.add_argument("--touch-x", type=int, required=True)
-    ap.add_argument("--touch-y", type=int, required=True)
-    ap.add_argument("--touch-overlap", type=float, default=0.0)
+    # Grid size / overlap default to the run's session.json
+    # (motion_collect_overlap), so partial runs stitch with just the path.
+    ap.add_argument("--touch-x", type=int)
+    ap.add_argument("--touch-y", type=int)
+    ap.add_argument("--touch-overlap", type=float)
     ap.add_argument("--sign", type=int, default=1, choices=(-1, 1))
     ap.add_argument("--seam-sigma-mm", type=float, default=0.05)
     ap.add_argument("--prior-sigma-mm", type=float, default=1.0)
     args = ap.parse_args()
+    meta_path = Path(args.session_dir) / "session.json"
+    if meta_path.exists():
+        with open(meta_path) as f:
+            meta = json.load(f)
+        args.touch_x = args.touch_x or meta.get("touch_x")
+        args.touch_y = args.touch_y or meta.get("touch_y")
+        if args.touch_overlap is None:
+            args.touch_overlap = meta.get("overlap", 0.0)
+    if not (args.touch_x and args.touch_y):
+        ap.error("--touch-x/--touch-y required (no session.json with a grid)")
     stitch_session_solved(
         args.session_dir, args.touch_x, args.touch_y,
-        touch_overlap=args.touch_overlap, gel_depth_sign=args.sign,
+        touch_overlap=args.touch_overlap or 0.0, gel_depth_sign=args.sign,
         seam_sigma_mm=args.seam_sigma_mm, prior_sigma_mm=args.prior_sigma_mm,
     )
