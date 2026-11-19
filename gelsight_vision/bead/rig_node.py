@@ -483,12 +483,26 @@ class BeadRigNode(Node):
     def preview(self, img: np.ndarray, title: str) -> None:
         if not self.show_preview:
             return
+        # Poll instead of waitKey(0): Python only runs the Ctrl+C handler between
+        # bytecodes, so a blocking waitKey(0) made the node ignore Ctrl+C until a
+        # key was pressed in the (possibly hidden) window. Closing the window also
+        # continues.
+        self.get_logger().info(f'preview window "{title}": press any key in it (or close it) '
+                               'to continue')
         try:
+            cv2.namedWindow(title, cv2.WINDOW_NORMAL)
             cv2.imshow(title, img)
-            cv2.waitKey(0)
+            while rclpy.ok():
+                if cv2.waitKey(50) != -1:
+                    break
+                if cv2.getWindowProperty(title, cv2.WND_PROP_VISIBLE) < 1:
+                    break
             cv2.destroyWindow(title)
+            cv2.waitKey(1)
         except cv2.error as e:  # headless
             self.get_logger().warn(f'preview unavailable: {e}')
+        if not rclpy.ok():
+            raise KeyboardInterrupt
 
     def ask(self, question: str) -> bool:
         if not self.confirm:
