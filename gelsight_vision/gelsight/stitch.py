@@ -657,6 +657,125 @@ def _robust_plane_inliers(
     return inl, coef
 
 
+def _detect_beads(
+    rgb_mosaic: np.ndarray,
+    valid: np.ndarray,
+    px_mm: float,
+    work_mm: float = 0.125,
+    bg_mm: float = 20.0,
+    thresh_mad: float = 6.0,
+    close_mm: float = 0.75,
+    open_mm: float = 0.75,
+    min_area_mm2: float = 10.0,
+    border_mm: float = 1.0,
+) -> dict:
+    """Find raised (or sunk) features -- weld beads, spot welds -- in the
+    GelSight RGB mosaic, without using any height data.
+
+    GelSight shading departs from the flat-gel colour wherever the surface
+    slopes, so a bead's flanks light up and its crown shows as a thin
+    flat-coloured line between them. Per pixel we take the RGB distance from
+    the local plate colour (a `bg_mm` median), threshold it at the plate
+    median + `thresh_mad` robust sigmas, close (`close_mm`) to bridge the
+    crown line, open (`open_mm`) to drop scratches and spatter, fill holes,
+    and keep blobs of at least `min_area_mm2`. Any number of blobs (lines,
+    dots, none) is fine: each is one feature.
+
+    Returns a dict with the work-resolution grid (`work_mm`, `labels`, 0 =
+    plate) and per-feature `beads` (area, half-width, centroid, bbox), plus
+    `dev` (the deviation image) for debugging.
+    """
+    f = max(1, int(round(work_mm / px_mm)))
+    work = px_mm * f
+    h, w = rgb_mosaic.shape[0] // f, rgb_mosaic.shape[1] // f
+    x = cv2.resize(rgb_mosaic[:h * f, :w * f], (w, h), interpolation=cv2.INTER_AREA).astype(np.float32)
+    ok = cv2.resize(valid[:h * f, :w * f].astype(np.float32), (w, h), interpolation=cv2.INTER_AREA) > 0.999
+    b = int(round(border_mm / work))
+    if b:
+        ok = cv2.erode(ok.astype(np.uint8), np.ones((2 * b + 1, 2 * b + 1), np.uint8)).astype(bool)
+
+    # Plate colour: large median on a 4x coarser grid (medianBlur needs uint8
+    # for big apertures), back up to the work grid.
+    d = 4
+    small = cv2.resize(x, (max(1, w // d), max(1, h // d)), interpolation=cv2.INTER_AREA)
+    k = max(3, int(round(bg_mm / (work * d))) | 1)
+    bg = cv2.medianBlur(np.clip(small, 0, 255).astype(np.uint8), k)
+    bg = cv2.resize(bg, (w, h), interpolation=cv2.INTER_LINEAR).astype(np.float32)
+    dev = cv2.GaussianBlur(np.linalg.norm(x - bg, axis=-1), (0, 0), max(0.25 / work, 0.5))
+
+    beads: list[dict] = []
+    labels = np.zeros((h, w), np.int32)
+    if ok.sum() < 100:
+        return dict(work_mm=work, labels=labels, beads=beads, dev=dev, thresh=float('nan'))
+    med = float(np.median(dev[ok]))
+    mad = 1.4826 * float(np.median(np.abs(dev[ok] - med))) + 1e-6
+    thresh = med + thresh_mad * mad
+    m = ((dev > thresh) & ok).astype(np.uint8)
+
+    def disk(r_mm):
+        r = max(1, int(round(r_mm / work)))
+        return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
+
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, disk(close_mm))
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, disk(open_mm))
+    contours, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    filled = np.zeros_like(m)
+    cv2.drawContours(filled, contours, -1, 1, thickness=cv2.FILLED)  # fills holes
+    filled &= ok.astype(np.uint8)
+    n, lab, stats, cent = cv2.connectedComponentsWithStats(filled, connectivity=8)
+    for i in range(1, n):
+        area = stats[i, cv2.CC_STAT_AREA] * work ** 2
+        if area < min_area_mm2:
+            continue
+        j = len(beads) + 1
+        labels[lab == i] = j
+        x0, y0, bw, bh = (int(stats[i, s]) for s in (cv2.CC_STAT_LEFT, cv2.CC_STAT_TOP,
+                                                     cv2.CC_STAT_WIDTH, cv2.CC_STAT_HEIGHT))
+        beads.append(dict(id=j, area_mm2=float(area), bbox=[y0, x0, bh, bw],
+                          centroid_mm=[float((cent[i, 1] + 0.5) * work), float((cent[i, 0] + 0.5) * work)]))
+    return dict(work_mm=work, labels=labels, beads=beads, dev=dev, thresh=thresh)
+
+
+def _contact_map(
+    img: np.ndarray, baseline: Optional[np.ndarray], px_mm: float,
+    base_tex: float, tex_ratio: float = 2.0, col_thresh: float = 40.0, close_mm: float = 0.3,
+) -> np.ndarray:
+    """Where the gel actually touches the part, from one GelSight frame.
+
+    Gel pressed on metal picks up its micro-texture (machining marks, pits,
+    spatter); gel held off the part (e.g. beside a tall bead the tip is
+    resting on) stays smooth like the no-contact baseline, and the depth
+    model reads it as flat surface. Contact = local high-pass texture above
+    `tex_ratio` x the baseline's texture level, or colour departing from the
+    baseline by more than `col_thresh` (sloped contact without texture),
+    closed by `close_mm`. Returns a bool map at the frame's resolution."""
+    f = img.astype(np.float32)
+    g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    hp = g - cv2.GaussianBlur(g, (0, 0), 0.15 / px_mm)
+    tex = np.sqrt(cv2.GaussianBlur(hp * hp, (0, 0), 0.5 / px_mm))
+    contact = tex > tex_ratio * base_tex
+    if baseline is not None and baseline.shape == img.shape:
+        col = cv2.GaussianBlur(np.linalg.norm(f - baseline, axis=-1), (0, 0), 0.5 / px_mm)
+        contact |= col > col_thresh
+    r = max(1, int(round(close_mm / px_mm)))
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
+    return cv2.morphologyEx(contact.astype(np.uint8), cv2.MORPH_CLOSE, k).astype(bool)
+
+
+def _bead_profile(labels: np.ndarray, j: int, work: float) -> tuple[np.ndarray, float]:
+    """Unit dome over feature `j`: 0 at its outline, 1 along its medial axis
+    (a line bead's centreline, a dot's centre). Uses a circular-arc cross
+    section on the inward distance, normalised by the feature's half-width
+    (99th percentile of that distance, robust to blobby ends)."""
+    inside = (labels == j).astype(np.uint8)
+    dist = cv2.distanceTransform(inside, cv2.DIST_L2, 5) * work
+    half = float(np.percentile(dist[inside > 0], 99)) if inside.any() else 0.0
+    if half <= 0:
+        return np.zeros(labels.shape, np.float32), 0.0
+    u = np.clip(dist / half, 0.0, 1.0)
+    return np.sqrt(1.0 - (1.0 - u) ** 2).astype(np.float32), half
+
+
 def stitch_session_solved(
     session_dir: Union[str, Path],
     touch_x: int,
@@ -688,6 +807,21 @@ def stitch_session_solved(
     steep_slope: float = 0.0,
     steep_dilate_mm: float = 0.5,
     steep_smooth_mm: float = 0.15,
+    bead_prior: bool = False,
+    bead_prior_sigma_mm: float = 0.5,
+    bead_thresh_mad: float = 6.0,
+    bead_min_area_mm2: float = 10.0,
+    bead_open_mm: float = 0.75,
+    output_tag: Optional[str] = None,
+    edge_trim: float = 0.0,
+    contact_mask: bool = False,
+    contact_tex_ratio: float = 2.0,
+    contact_col: float = 40.0,
+    contact_z_is_peak: bool = False,
+    bead_height_from_z: bool = False,
+    huber: str = 'all',
+    out_dir: Optional[Union[str, Path]] = None,
+    write_images: bool = True,
 ) -> Optional[dict]:
     """Stitch the touch grid with per-tile Z offsets solved from tile overlaps.
 
@@ -749,7 +883,61 @@ def stitch_session_solved(
     surface around them (steep edges become smooth ramps between the
     trusted heights on either side).
 
-    Writes `gelsight_solved_*` next to the captures (depth npy + previews,
+    `bead_prior` (off by default; off = the solve above, unchanged) is a
+    Z-blind alternative to the two robot priors. Raised features (weld beads,
+    spot welds -- any number, any shape, or none) are found in the GelSight
+    RGB mosaic (`_detect_beads`), and each gets a unit dome template that is
+    0 at its outline and 1 along its medial axis (`_bead_profile`). Each tile's
+    offset and tilt are then pulled (`bead_prior_sigma_mm`, `tilt_prior_sigma`)
+    toward  sum_j h_j * (template j over that tile),  i.e. toward a flat
+    plate at height 0 plus one dome per feature, where the dome amplitudes h_j
+    are extra unknowns solved with everything else (either sign, so a groove
+    comes out as a dip). The overlaps still set the local shape; the prior
+    only replaces what contact Z used to pin: the large-scale shape, which is
+    now "flat plate, features crest along their centre". Contact Z is not
+    used in the solve; if present it only sets a constant display datum (so
+    heights stay in plate-frame mm) and is reported for comparison under
+    `bead_prior.z_check`. Outputs go to `gelsight_beadprior_*` unless
+    `output_tag` says otherwise, so the default outputs are left alone.
+
+    `edge_trim` (fraction of each tile axis, per edge; 0 = off) drops that
+    band at every tile border from the overlap constraints and nearly zeroes
+    its weight in the composite. The gsrobotics Poisson integration leaves
+    large ramps at tile borders that differ from tile to tile (the session
+    median only removes the shared part); with real overlap there is enough
+    tile interior to give the border up.
+
+    `contact_mask` (off by default) finds, per tile, where the gel actually
+    touched the part (`_contact_map`: micro-texture or colour departing from
+    `gelsight_baseline.png`). Gel held off the part -- beside a bead taller
+    than the gel can wrap, the tip rests on the crown and the plate around it
+    is never touched -- reads as flat and, through the overlaps, pins the bead
+    crown to plate level. No-contact pixels are left out of each tile's
+    centring/detrend and of the overlap constraints, and only fill the
+    composite where no tile touched.
+
+    `contact_z_is_peak` (contact-Z mode): the force stop happens when the
+    highest point under the gel touches, so contact Z is the tile's *peak*
+    height, not its mean; the prior then targets c_k = Z_k - p99(relief_k).
+    Use with a large `contact_outlier_mm` so bead tiles keep their prior.
+
+    `bead_height_from_z` (with `bead_prior`): the solve stays Z-blind, then
+    each feature's dome is rescaled so its crown sits at the median contact-Z
+    excess (over the robust contact plane) of the tiles on that crown -- one
+    robot number per feature, averaged over its tiles. The gel's photometric
+    slopes read steep weld flanks several times too shallow, so this is the
+    only height scale for a tall bead short of a gel calibration.
+
+    `huber` picks which overlap pairs the IRLS may down-weight: 'all' (the
+    default), 'off' (plain least squares), or 'nonbead' (pairs touching a
+    `bead_prior` feature keep full weight -- they disagree more than plate
+    pairs by nature, and down-weighting them flattens the bead).
+
+    `out_dir` writes outputs there instead of next to the captures, and
+    `write_images=False` writes only the depth npy and solve JSON (plus the
+    bead map), for quick parameter sweeps.
+
+    Writes `gelsight_<output_tag>_*` (default `gelsight_solved_*`) next to the captures (depth npy + previews,
     RGB mosaic, shaded relief, overlays, before/after comparison, PLY, and a
     JSON with the per-tile solution). Returns that JSON as a dict.
     """
@@ -843,12 +1031,46 @@ def stitch_session_solved(
 
     # Session median kills the per-touch Poisson artifact (see stitch_session).
     bias = np.median(np.stack([raw[k] for k in ids]), axis=0) if debias else 0.0
+
+    # Per-tile contact maps at relief resolution (see `contact_mask`).
+    contact: dict[int, np.ndarray] = {}
+    if contact_mask:
+        rgb_px_mm = mm_per_px * th / rgb[ids[0]].shape[0]
+        bpath = session_dir / "gelsight_baseline.png"
+        base_img = cv2.imread(str(bpath)) if bpath.exists() else None
+        if base_img is not None:
+            base_img = np.ascontiguousarray(flip(cv2.rotate(base_img, cv2.ROTATE_90_COUNTERCLOCKWISE)))
+            bg = cv2.cvtColor(base_img, cv2.COLOR_BGR2GRAY).astype(np.float32)
+            bhp = bg - cv2.GaussianBlur(bg, (0, 0), 0.15 / rgb_px_mm)
+            base_tex = float(np.median(np.sqrt(cv2.GaussianBlur(bhp * bhp, (0, 0), 0.5 / rgb_px_mm))))
+            base_f = base_img.astype(np.float32)
+        else:  # no baseline: texture floor from the smoothest 5% of all tiles
+            base_f = None
+            samp = []
+            for k in ids[::max(1, len(ids) // 50)]:
+                g = cv2.cvtColor(rgb[k], cv2.COLOR_BGR2GRAY).astype(np.float32)
+                hp = g - cv2.GaussianBlur(g, (0, 0), 0.15 / rgb_px_mm)
+                samp.append(np.percentile(np.sqrt(cv2.GaussianBlur(hp * hp, (0, 0), 0.5 / rgb_px_mm)), 5))
+            base_tex = float(np.median(samp))
+            print(f"  contact mask: no {bpath.name}, texture floor from tiles only")
+        for k in ids:
+            cm = _contact_map(rgb[k], base_f, rgb_px_mm, base_tex, contact_tex_ratio, contact_col)
+            contact[k] = cv2.resize(cm.astype(np.float32), (tw, th), interpolation=cv2.INTER_AREA) > 0.5
+        frac = np.array([contact[k].mean() for k in ids])
+        print(f"  contact mask: median {np.median(frac):.0%} of tile in contact, "
+              f"{int((frac < 0.5).sum())} tiles under 50%")
+
     relief: dict[int, np.ndarray] = {}
     for k in ids:
         d = flip(np.rot90(raw[k] - bias, k=1)) * unit_mm * gel_depth_sign
-        d = d - np.nanmedian(d)  # offset is solved for; centre so _fit_plane's mask holds
+        dc = np.where(contact[k], d, np.nan) if contact else d  # centre/detrend on contact only
+        if contact and np.isfinite(dc).sum() < 100:
+            dc = d
+        d = d - np.nanmedian(dc)  # offset is solved for; centre so _fit_plane's mask holds
+        dc = dc - np.nanmedian(dc)
         d = np.where(np.abs(d) > outlier_mm, np.nan, d)
-        relief[k] = np.ascontiguousarray(d - _fit_plane(d, outlier_mm=outlier_mm)).astype(np.float32)
+        dc = np.where(np.abs(dc) > outlier_mm, np.nan, dc)
+        relief[k] = np.ascontiguousarray(d - _fit_plane(dc, outlier_mm=outlier_mm)).astype(np.float32)
 
     # Per-tile trust: False near steep relief (see `steep_slope`).
     trust: dict[int, np.ndarray] = {}
@@ -869,6 +1091,15 @@ def stitch_session_solved(
         print(f"  steep-slope mask: {frac:.1%} of tile pixels distrusted (> {steep_slope} mm/mm)")
     # Relief used for the overlap constraints: distrusted pixels -> NaN.
     relief_fit = {k: np.where(trust[k], relief[k], np.nan) if trust else relief[k] for k in ids}
+    if contact:
+        relief_fit = {k: np.where(contact[k], v, np.nan) for k, v in relief_fit.items()}
+    edge_keep = None
+    if edge_trim > 0:
+        er, ec = int(round(edge_trim * th)), int(round(edge_trim * tw))
+        edge_keep = np.zeros((th, tw), bool)
+        edge_keep[er:th - er, ec:tw - ec] = True
+        relief_fit = {k: np.where(edge_keep, v, np.nan) for k, v in relief_fit.items()}
+        print(f"  edge trim: {er} / {ec} px per tile edge left out of overlaps")
 
     yy = (np.arange(th) - (th - 1) / 2.0) * mm_per_px  # tile-local mm, rows
     xx = (np.arange(tw) - (tw - 1) / 2.0) * mm_per_px  # tile-local mm, cols
@@ -944,6 +1175,26 @@ def stitch_session_solved(
             pairs.append(dict(a=pos[k], b=pos[nb], horiz=horiz, slope_t=slope_t,
                               eA=eA[ok], eB=eB[ok], yA=yA, xA=xA, yB=yB, xB=xB))
 
+    # ---- RGB mosaic (independent of the Z solve) ---------------------------
+    H = int(round(row_step * (touch_x - 1))) + th
+    W = int(round(col_step * (touch_y - 1))) + tw
+    ramp_r = np.minimum(np.arange(th) + 1, th - np.arange(th)).astype(np.float32)
+    ramp_c = np.minimum(np.arange(tw) + 1, tw - np.arange(tw)).astype(np.float32)
+    feather = np.minimum(ramp_r[:, None], ramp_c[None, :])
+
+    rh, rw = rgb[ids[0]].shape[:2]
+    s_rgb = rh / th
+    RH, RW = int(round(H * s_rgb)), int(round(W * s_rgb))
+    feather_rgb = cv2.resize(feather, (rw, rh), interpolation=cv2.INTER_AREA)[..., None]
+    racc = np.zeros((RH, RW, 3), np.float64)
+    rws = np.zeros((RH, RW, 1), np.float64)
+    for k in ids:
+        r0, c0 = (int(round(o * s_rgb)) for o in origin[k])
+        hh, ww = min(rh, RH - r0), min(rw, RW - c0)
+        racc[r0:r0 + hh, c0:c0 + ww] += rgb[k][:hh, :ww] * feather_rgb[:hh, :ww]
+        rws[r0:r0 + hh, c0:c0 + ww] += feather_rgb[:hh, :ww]
+    rgb_mosaic = np.where(rws > 0, racc / np.maximum(rws, 1e-9), 40).astype(np.uint8)
+
     # ---- contact-Z prior ---------------------------------------------------
     n_t = len(ids)
     zc = np.array([contact_z.get(k, np.nan) for k in ids])
@@ -956,6 +1207,11 @@ def stitch_session_solved(
         prior_target, prior_w = np.zeros(n_t), np.full(n_t, 1e-6)
     else:
         prior_target = np.where(prior_ok, zc, 0.0)
+        if contact_z_is_peak:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                peak = np.array([np.nanpercentile(relief_fit[k], 99) for k in ids])
+            prior_target = np.where(prior_ok & np.isfinite(peak), zc - np.nan_to_num(peak), prior_target)
         prior_w = np.where(prior_ok, 1.0 / prior_sigma_mm ** 2, 0.0)
     if plane is not None and prior_ok.sum() >= 3:
         # Contact plane is per grid step; convert to mm/mm in tile-local (y, x).
@@ -963,6 +1219,49 @@ def stitch_session_solved(
         tilt_w = 1.0 / tilt_prior_sigma ** 2
     else:
         tilt_target, tilt_w = (0.0, 0.0), 1e-6
+
+    # ---- bead-shape prior (Z-blind; replaces the two priors above) ---------
+    # G[t, p, j]: plane fit (p = offset, d/dy, d/dx) of feature j's unit dome
+    # over tile t's footprint, so the prior is  tile_params ~= G @ h.
+    G = np.zeros((n_t, 3, 0))
+    beads_found: Optional[dict] = None
+    bead_list: list[dict] = []
+    if bead_prior:
+        beads_found = _detect_beads(
+            rgb_mosaic, rws[..., 0] > 0, mm_per_px / s_rgb,
+            thresh_mad=bead_thresh_mad, min_area_mm2=bead_min_area_mm2, open_mm=bead_open_mm,
+        )
+        bead_list = beads_found['beads']
+        work = beads_found['work_mm']
+        lab_w = beads_found['labels']
+        G = np.zeros((n_t, 3, len(bead_list)))
+        # Tile footprints on the work grid; global mm = (pixel index + 0.5) * pitch.
+        fh, fw = th * mm_per_px, tw * mm_per_px
+        foot = []
+        for k in ids:
+            y0, x0 = origin[k][0] * mm_per_px, origin[k][1] * mm_per_px
+            i0, i1 = max(0, int(np.ceil(y0 / work - 0.5))), min(lab_w.shape[0], int(np.floor((y0 + fh) / work - 0.5)) + 1)
+            j0, j1 = max(0, int(np.ceil(x0 / work - 0.5))), min(lab_w.shape[1], int(np.floor((x0 + fw) / work - 0.5)) + 1)
+            yl = (np.arange(i0, i1) + 0.5) * work - (y0 + fh / 2.0)
+            xl = (np.arange(j0, j1) + 0.5) * work - (x0 + fw / 2.0)
+            Yl, Xl = np.meshgrid(yl, xl, indexing='ij')
+            A = np.column_stack([np.ones(Yl.size), Yl.ravel(), Xl.ravel()])
+            foot.append((i0, i1, j0, j1, np.linalg.pinv(A) if A.shape[0] >= 3 else None))
+        for jb, bd in enumerate(bead_list):
+            prof, half = _bead_profile(lab_w, bd['id'], work)
+            bd['half_width_mm'] = half
+            by0, bx0, bh, bw = bd['bbox']
+            for t, (i0, i1, j0, j1, P) in enumerate(foot):
+                if P is None or i1 <= by0 or i0 >= by0 + bh or j1 <= bx0 or j0 >= bx0 + bw:
+                    continue
+                G[t, :, jb] = P @ prof[i0:i1, j0:j1].ravel()
+        prior_target, prior_w = np.zeros(n_t), np.full(n_t, 1.0 / bead_prior_sigma_mm ** 2)
+        tilt_target, tilt_w = (0.0, 0.0), 1.0 / tilt_prior_sigma ** 2
+        print(f"  bead prior: {len(bead_list)} feature(s) "
+              + ", ".join(f"#{b['id']} {b['area_mm2']:.0f} mm^2 (half-width {b['half_width_mm']:.2f} mm)"
+                          for b in bead_list)
+              + "; contact Z not used in the solve")
+    n_b = G.shape[2]
 
     # ---- weighted least squares + Huber IRLS -------------------------------
     def jac(p):
@@ -977,8 +1276,22 @@ def stitch_session_solved(
         p['w0'] = 1.0 / (seam_sigma_mm ** 2 * len(p['t']))
         p['w'] = np.full(len(p['t']), p['w0'])
 
-    n_u = 3 * n_t
+    if huber not in ('all', 'off', 'nonbead'):
+        raise ValueError(f"huber must be 'all', 'off' or 'nonbead', not {huber!r}")
+    if huber == 'nonbead' and not bead_prior:
+        raise ValueError("huber='nonbead' needs bead_prior=True (it uses the detected features)")
+    bead_tile = np.abs(G[:, 0, :]).sum(axis=1) > 0.02 if n_b else np.zeros(n_t, bool)
+    n_u = 3 * n_t + n_b  # tile (c, a, b) triples, then one dome amplitude per feature
+    if n_b:
+        # Prior residual  tile_params - G h  (target 0): its tile-tile diagonal
+        # is the prior_w / tilt_w added below; these are the cross terms.
+        wv = np.empty(3 * n_t)
+        wv[0::3], wv[1::3], wv[2::3] = prior_w, tilt_w, tilt_w
+        Gm = G.reshape(3 * n_t, n_b)
+        WG = wv[:, None] * Gm
+        bead_block = (WG, Gm.T @ WG + 1e-9 * np.eye(n_b))
     u = np.zeros(n_u)
+    free_tiles: set[int] = set()
     for it in range(irls_iters):
         AtA = np.zeros((n_u, n_u))
         Atb = np.zeros(n_u)
@@ -1004,17 +1317,71 @@ def stitch_session_solved(
         AtA[ci + 2, ci + 2] += tilt_w
         Atb[ci + 1] += tilt_w * tilt_target[0]
         Atb[ci + 2] += tilt_w * tilt_target[1]
-        u = np.linalg.solve(AtA, Atb)
+        if n_b:
+            T = slice(0, 3 * n_t)
+            Hb = slice(3 * n_t, n_u)
+            AtA[T, Hb] -= bead_block[0]
+            AtA[Hb, T] -= bead_block[0].T
+            AtA[Hb, Hb] += bead_block[1]
+        try:
+            u = np.linalg.solve(AtA, Atb)
+        except np.linalg.LinAlgError:
+            # A tile with no usable overlap and no prior (e.g. masked out by
+            # contact_mask + edge_trim with its contact Z rejected) is
+            # unconstrained; a tiny ridge parks it at 0 instead of failing.
+            u = np.linalg.solve(AtA + 1e-6 * np.eye(n_u), Atb)
+            if it == 0:
+                free_tiles.update(ids[i] for i in range(n_t) if AtA[3 * i, 3 * i] < 1e-9)
+                print(f"  warning: {len(free_tiles)} unconstrained tile(s) "
+                      f"{sorted(free_tiles)[:10]} -> ridge, left out of the composite")
         if not pairs:
             break
         res = [p['J'] @ np.r_[u[3 * p['a']:3 * p['a'] + 3], u[3 * p['b']:3 * p['b'] + 3]] - p['t']
                for p in pairs]
+        if huber == 'off':
+            break
         allres = np.concatenate(res)
         scale = 1.4826 * np.median(np.abs(allres - np.median(allres))) + 1e-9
         for p, r in zip(pairs, res):
+            if huber == 'nonbead' and (bead_tile[p['a']] or bead_tile[p['b']]):
+                continue
             p['w'] = p['w0'] * np.minimum(1.0, 1.345 * scale / np.maximum(np.abs(r), 1e-12))
 
-    sol = u.reshape(n_t, 3)  # columns: c, a (d/dy), b (d/dx)
+    sol = u[:3 * n_t].reshape(n_t, 3).copy()  # columns: c, a (d/dy), b (d/dx)
+    h_bead = u[3 * n_t:]
+
+    bead_summary = None
+    if bead_prior:
+        # Display datum only: the Z-blind solve puts the plate at 0, so shift it
+        # to the plate's median contact Z (if any) to keep plate-frame mm.
+        on_plate = np.abs(G[:, 0, :]).sum(axis=1) < 1e-3 if n_b else np.ones(n_t, bool)
+        zp = np.isfinite(zc) & ~no_contact & on_plate
+        datum = float(np.median(zc[zp])) if zp.any() else 0.0
+        sol[:, 0] += datum
+        # Comparison against contact Z (not used above): per feature, the
+        # robot-measured excess over the plate's robust contact plane on tiles
+        # that sit mostly on that feature's crown, vs the solved excess there.
+        z_check = []
+        zres = zc - (np.column_stack([rc_arr, np.ones(n_t)]) @ plane) if plane is not None else None
+        for jb, bd in enumerate(bead_list):
+            crown = (G[:, 0, jb] > 0.5) & np.isfinite(zc) & ~no_contact
+            row = dict(id=bd['id'], h_mm=float(h_bead[jb]), n_crown_tiles=int(crown.sum()))
+            if crown.any():
+                row['solved_crown_tile_excess_mm'] = float(np.median(sol[crown, 0] - datum))
+                if zres is not None:
+                    row['contact_z_crown_tile_excess_mm'] = float(np.median(zres[crown]))
+            z_check.append(row)
+            print(f"  bead #{bd['id']}: dome h = {h_bead[jb]:+.3f} mm" + (
+                f"; crown tiles solved {row['solved_crown_tile_excess_mm']:+.3f} mm vs contact-Z "
+                f"{row.get('contact_z_crown_tile_excess_mm', float('nan')):+.3f} mm above plate"
+                if crown.any() else ""))
+        bead_summary = dict(
+            sigma_mm=bead_prior_sigma_mm, tilt_sigma=tilt_prior_sigma,
+            thresh_mad=bead_thresh_mad, min_area_mm2=bead_min_area_mm2, open_mm=bead_open_mm,
+            work_mm=beads_found['work_mm'], display_datum_mm=datum,
+            features=[dict(b, h_mm=float(h_bead[i])) for i, b in enumerate(bead_list)],
+            z_check=z_check,
+        )
 
     # Seam step = mean disagreement across a shared edge; compare against the
     # naive placement (contact Z offset, no tilt) that stitch_session_anchored
@@ -1038,12 +1405,7 @@ def stitch_session_solved(
         r = np.concatenate([p['J'] @ np.r_[v[p['a']], v[p['b']]] - p['t'] for p in pairs])
         return float(np.sqrt(np.mean(r ** 2)))
 
-    # ---- composite depth + RGB (feathered in overlaps) ---------------------
-    H = int(round(row_step * (touch_x - 1))) + th
-    W = int(round(col_step * (touch_y - 1))) + tw
-    ramp_r = np.minimum(np.arange(th) + 1, th - np.arange(th)).astype(np.float32)
-    ramp_c = np.minimum(np.arange(tw) + 1, tw - np.arange(tw)).astype(np.float32)
-    feather = np.minimum(ramp_r[:, None], ramp_c[None, :])
+    # ---- composite depth (feathered in overlaps; RGB mosaic built above) ---
     plane_tile = lambda c, a, b: c + a * yy[:, None] + b * xx[None, :]  # noqa: E731
 
     def composite(v):
@@ -1051,10 +1413,16 @@ def stitch_session_solved(
         wsum = np.zeros((H, W), np.float64)
         tsum = np.zeros((H, W), np.float64) if trust else None
         for k in ids:
+            if k in free_tiles:
+                continue
             r0, c0 = origin[k]
             z = relief[k] + plane_tile(*v[pos[k]])
             m = np.isfinite(z)
             w = feather * m
+            if edge_keep is not None:  # trimmed border only fills where nothing else does
+                w = w * np.where(edge_keep, 1.0, 1e-3)
+            if contact:  # likewise gel that never touched the part
+                w = w * np.where(contact[k], 1.0, 1e-3)
             if trust:  # trusted readings outweigh distrusted ones 1000:1
                 w = w * np.where(trust[k], 1.0, 1e-3)
                 tsum[r0:r0 + th, c0:c0 + tw] += feather * trust[k]
@@ -1067,88 +1435,110 @@ def stitch_session_solved(
         return out
 
     depth_solved = composite(sol)
-    depth_naive = composite(naive)
-
-    rh, rw = rgb[ids[0]].shape[:2]
-    s_rgb = rh / th
-    RH, RW = int(round(H * s_rgb)), int(round(W * s_rgb))
-    feather_rgb = cv2.resize(feather, (rw, rh), interpolation=cv2.INTER_AREA)[..., None]
-    racc = np.zeros((RH, RW, 3), np.float64)
-    rws = np.zeros((RH, RW, 1), np.float64)
-    for k in ids:
-        r0, c0 = (int(round(o * s_rgb)) for o in origin[k])
-        hh, ww = min(rh, RH - r0), min(rw, RW - c0)
-        racc[r0:r0 + hh, c0:c0 + ww] += rgb[k][:hh, :ww] * feather_rgb[:hh, :ww]
-        rws[r0:r0 + hh, c0:c0 + ww] += feather_rgb[:hh, :ww]
-    rgb_mosaic = np.where(rws > 0, racc / np.maximum(rws, 1e-9), 40).astype(np.uint8)
+    if bead_prior and bead_height_from_z and bead_summary is not None:
+        lab_w, work = beads_found['labels'], beads_found['work_mm']
+        for jb, (bd, row) in enumerate(zip(bead_list, bead_summary['z_check'])):
+            target = row.get('contact_z_crown_tile_excess_mm')
+            if target is None or row['n_crown_tiles'] < 3:
+                continue
+            delta = target - float(h_bead[jb])
+            prof = _bead_profile(lab_w, bd['id'], work)[0]
+            # work grid -> depth grid (both start at the mosaic origin)
+            up = cv2.resize(prof, (int(round(prof.shape[1] * work / mm_per_px)),
+                                   int(round(prof.shape[0] * work / mm_per_px))), interpolation=cv2.INTER_LINEAR)
+            hh, ww = min(H, up.shape[0]), min(W, up.shape[1])
+            depth_solved[:hh, :ww] += delta * up[:hh, :ww]
+            row['dome_rescaled_to_mm'] = target
+            print(f"  bead #{bd['id']}: dome rescaled {h_bead[jb]:+.3f} -> {target:+.3f} mm "
+                  f"(contact-Z median over {row['n_crown_tiles']} crown tiles)")
+    depth_naive = composite(naive) if write_images else None
 
     # ---- outputs -----------------------------------------------------------
-    out = lambda name: session_dir / f"gelsight_solved_{name}"  # noqa: E731
+    tag = output_tag or ("beadprior" if bead_prior else "solved")
+    dest = Path(out_dir) if out_dir is not None else session_dir
+    dest.mkdir(parents=True, exist_ok=True)
+    out = lambda name: dest / f"gelsight_{tag}_{name}"  # noqa: E731
     np.save(out("depth.npy"), depth_solved)
-    cv2.imwrite(str(out("rgb.png")), rgb_mosaic)
+    if write_images:
+        cv2.imwrite(str(out("rgb.png")), rgb_mosaic)
+    if bead_prior:
+        # Detected features: outline + unit dome over the work-res RGB mosaic.
+        lab_w = beads_found['labels']
+        small = cv2.resize(rgb_mosaic, (lab_w.shape[1], lab_w.shape[0]), interpolation=cv2.INTER_AREA)
+        dome = np.zeros(lab_w.shape, np.float32)
+        for bd in bead_list:
+            dome = np.maximum(dome, _bead_profile(lab_w, bd['id'], beads_found['work_mm'])[0])
+        heat = cv2.applyColorMap((dome * 255).astype(np.uint8), cv2.COLORMAP_INFERNO)
+        vis = np.where(lab_w[..., None] > 0, cv2.addWeighted(small, 0.4, heat, 0.6, 0.0), small)
+        cnts, _ = cv2.findContours((lab_w > 0).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        cv2.drawContours(vis, cnts, -1, (0, 255, 0), 1)
+        cv2.imwrite(str(out("beads.png")), vis)
 
-    # Visualizations at the RGB mosaic's resolution so every PNG aligns 1:1.
-    viz_px_mm = mm_per_px / s_rgb
-    dz = _fill_small_holes(_resize_nan(depth_solved, (RH, RW)), 3.0)
-    dz_naive = _fill_small_holes(_resize_nan(depth_naive, (RH, RW)), 3.0)
-    lo, hi = (float(v) for v in np.nanpercentile(dz, [1, 99]))
-    save_height_preview(dz, out("depth_preview.png"), scale_factor=1.0, value_range=(lo, hi))
+    lo = hi = float('nan')
+    n_pts = 0
+    if write_images:
+        # Visualizations at the RGB mosaic's resolution so every PNG aligns 1:1.
+        viz_px_mm = mm_per_px / s_rgb
+        dz = _fill_small_holes(_resize_nan(depth_solved, (RH, RW)), 3.0)
+        dz_naive = _fill_small_holes(_resize_nan(depth_naive, (RH, RW)), 3.0)
+        lo, hi = (float(v) for v in np.nanpercentile(dz, [1, 99]))
+        save_height_preview(dz, out("depth_preview.png"), scale_factor=1.0, value_range=(lo, hi))
 
-    # Detail: high-pass relief so sub-mm texture isn't swamped by plate tilt.
-    sig = detail_sigma_mm / viz_px_mm
-    low = _fill_small_holes(dz, 3 * sig)
-    low = cv2.GaussianBlur(np.nan_to_num(low, nan=float(np.nanmedian(dz))), (0, 0), sig)
-    detail = dz - low
-    dlim = float(np.nanpercentile(np.abs(detail), 99))
-    lut = _diverging_lut()
-    save_height_preview(detail, out("detail_preview.png"), colormap=lut,
-                        scale_factor=1.0, value_range=(-dlim, dlim))
+        # Detail: high-pass relief so sub-mm texture isn't swamped by plate tilt.
+        sig = detail_sigma_mm / viz_px_mm
+        low = _fill_small_holes(dz, 3 * sig)
+        low = cv2.GaussianBlur(np.nan_to_num(low, nan=float(np.nanmedian(dz))), (0, 0), sig)
+        detail = dz - low
+        dlim = float(np.nanpercentile(np.abs(detail), 99))
+        lut = _diverging_lut()
+        save_height_preview(detail, out("detail_preview.png"), colormap=lut,
+                            scale_factor=1.0, value_range=(-dlim, dlim))
 
-    shade = _hillshade(dz, viz_px_mm, shade_exaggeration)
-    shade_u8 = (np.nan_to_num(shade, nan=0.16) * 255).astype(np.uint8)
-    cv2.imwrite(str(out("shaded.png")), shade_u8)
+        shade = _hillshade(dz, viz_px_mm, shade_exaggeration)
+        shade_u8 = (np.nan_to_num(shade, nan=0.16) * 255).astype(np.uint8)
+        cv2.imwrite(str(out("shaded.png")), shade_u8)
 
-    color = _colorize(dz, lo, hi)
-    shade3 = np.nan_to_num(shade, nan=1.0)[..., None]
-    relief_shaded = (color * (0.35 + 0.65 * shade3)).astype(np.uint8)
-    cv2.imwrite(str(out("color_relief.png")), relief_shaded)
-    overlay = cv2.addWeighted(rgb_mosaic, 0.55, color, 0.45, 0.0)
-    cv2.imwrite(str(out("rgb_depth_overlay.png")), overlay)
-    rgb_shaded = (rgb_mosaic * (0.4 + 0.6 * shade3)).astype(np.uint8)
-    cv2.imwrite(str(out("rgb_shaded.png")), rgb_shaded)
+        color = _colorize(dz, lo, hi)
+        shade3 = np.nan_to_num(shade, nan=1.0)[..., None]
+        relief_shaded = (color * (0.35 + 0.65 * shade3)).astype(np.uint8)
+        cv2.imwrite(str(out("color_relief.png")), relief_shaded)
+        overlay = cv2.addWeighted(rgb_mosaic, 0.55, color, 0.45, 0.0)
+        cv2.imwrite(str(out("rgb_depth_overlay.png")), overlay)
+        rgb_shaded = (rgb_mosaic * (0.4 + 0.6 * shade3)).astype(np.uint8)
+        cv2.imwrite(str(out("rgb_shaded.png")), rgb_shaded)
 
-    # Before/after: naive contact-Z placement vs solved, same color scale,
-    # plus the per-tile offset correction (solved c - contact Z).
-    corr = np.full((RH, RW), np.nan, np.float32)
-    for k in ids:
-        if np.isfinite(zc[pos[k]]):
-            r0, c0 = (int(round(o * s_rgb)) for o in origin[k])
-            corr[r0:r0 + rh, c0:c0 + rw] = sol[pos[k], 0] - zc[pos[k]]
-    clim = float(np.nanmax(np.abs(corr))) if np.isfinite(corr).any() else 1.0
-    shade_naive = np.nan_to_num(_hillshade(dz_naive, viz_px_mm, shade_exaggeration), nan=1.0)[..., None]
-    panels = [
-        _label((_colorize(dz_naive, lo, hi) * (0.35 + 0.65 * shade_naive)).astype(np.uint8),
-               f"naive contact-Z  |  {lo:.2f}..{hi:.2f} mm"),
-        _label(relief_shaded, f"{solve_mode}-solved  |  {lo:.2f}..{hi:.2f} mm"),
-        _label(_colorize(corr, -clim, clim, lut), f"offset correction  |  +-{clim:.2f} mm"),
-    ]
-    gap = np.full((panels[0].shape[0], 12, 3), 255, np.uint8)
-    cv2.imwrite(str(out("comparison.png")),
-                np.hstack([panels[0], gap, panels[1], gap, panels[2]]))
+        # Before/after: naive contact-Z placement vs solved, same color scale,
+        # plus the per-tile offset correction (solved c - contact Z).
+        corr = np.full((RH, RW), np.nan, np.float32)
+        for k in ids:
+            if np.isfinite(zc[pos[k]]):
+                r0, c0 = (int(round(o * s_rgb)) for o in origin[k])
+                corr[r0:r0 + rh, c0:c0 + rw] = sol[pos[k], 0] - zc[pos[k]]
+        clim = float(np.nanmax(np.abs(corr))) if np.isfinite(corr).any() else 1.0
+        shade_naive = np.nan_to_num(_hillshade(dz_naive, viz_px_mm, shade_exaggeration), nan=1.0)[..., None]
+        panels = [
+            _label((_colorize(dz_naive, lo, hi) * (0.35 + 0.65 * shade_naive)).astype(np.uint8),
+                   f"naive contact-Z  |  {lo:.2f}..{hi:.2f} mm"),
+            _label(relief_shaded, f"{solve_mode}-solved  |  {lo:.2f}..{hi:.2f} mm"),
+            _label(_colorize(corr, -clim, clim, lut), f"offset correction  |  +-{clim:.2f} mm"),
+        ]
+        gap = np.full((panels[0].shape[0], 12, 3), 255, np.uint8)
+        cv2.imwrite(str(out("comparison.png")),
+                    np.hstack([panels[0], gap, panels[1], gap, panels[2]]))
 
-    # Point cloud (meters, centred on the mosaic), coloured from the RGB mosaic.
-    v, uu = np.mgrid[0:H:ply_stride, 0:W:ply_stride]
-    zs = depth_solved[v, uu]
-    ok = np.isfinite(zs)
-    rv = np.clip((v[ok] * s_rgb).astype(int), 0, RH - 1)
-    ru = np.clip((uu[ok] * s_rgb).astype(int), 0, RW - 1)
-    n_pts = _write_ply(
-        out("cloud.ply"),
-        ((uu[ok] - W / 2.0) * mm_per_px * 1e-3).astype(np.float32),
-        ((v[ok] - H / 2.0) * mm_per_px * 1e-3).astype(np.float32),
-        (zs[ok] * 1e-3).astype(np.float32),
-        rgb_mosaic[rv, ru],
-    )
+        # Point cloud (meters, centred on the mosaic), coloured from the RGB mosaic.
+        v, uu = np.mgrid[0:H:ply_stride, 0:W:ply_stride]
+        zs = depth_solved[v, uu]
+        ok = np.isfinite(zs)
+        rv = np.clip((v[ok] * s_rgb).astype(int), 0, RH - 1)
+        ru = np.clip((uu[ok] * s_rgb).astype(int), 0, RW - 1)
+        n_pts = _write_ply(
+            out("cloud.ply"),
+            ((uu[ok] - W / 2.0) * mm_per_px * 1e-3).astype(np.float32),
+            ((v[ok] - H / 2.0) * mm_per_px * 1e-3).astype(np.float32),
+            (zs[ok] * 1e-3).astype(np.float32),
+            rgb_mosaic[rv, ru],
+        )
 
     rms = lambda a: float(np.sqrt(np.mean(a ** 2))) if a.size else float('nan')  # noqa: E731
     summary = {
@@ -1157,6 +1547,9 @@ def stitch_session_solved(
         'step_px': [row_step_i, col_step_i], 'step_source': step_source,
         'overlap_px': [ov_rows, ov_cols], 'solve_mode': solve_mode,
         'steep_slope': steep_slope, 'steep_dilate_mm': steep_dilate_mm,
+        'edge_trim': edge_trim, 'huber': huber, 'gel_depth_sign': gel_depth_sign,
+        'contact_mask': contact_mask, 'contact_z_is_peak': contact_z_is_peak,
+        'bead_height_from_z': bead_height_from_z,
         'n_pairs': len(pairs),
         'orientation': orientation, 'orientation_scores': orient_scores,
         'pair_residual_rms_mm': {'naive': pair_residual_rms(naive), 'solved': pair_residual_rms(sol)},
@@ -1178,10 +1571,12 @@ def stitch_session_solved(
                 'offset_mm': float(sol[pos[k], 0]),
                 'tilt_y_mm_per_mm': float(sol[pos[k], 1]),
                 'tilt_x_mm_per_mm': float(sol[pos[k], 2]),
-                'prior_used': bool(prior_ok[pos[k]]),
+                'prior_used': bool(prior_ok[pos[k]]) and not bead_prior,
             } for k in ids
         },
     }
+    if bead_summary is not None:
+        summary['bead_prior'] = bead_summary
     with open(out("solve.json"), 'w') as f:
         json.dump(summary, f, indent=2)
 
@@ -1194,13 +1589,14 @@ def stitch_session_solved(
     print(f"  depth  -> {out('depth.npy')} ({lo:.2f}..{hi:.2f} mm, p1..p99)")
     print(f"  rgb    -> {out('rgb.png')}")
     print(f"  views  -> depth_preview, detail_preview, shaded, color_relief, "
-          f"rgb_depth_overlay, rgb_shaded, comparison (.png)")
+          f"rgb_depth_overlay, rgb_shaded, comparison{', beads' if bead_prior else ''} (.png)")
     print(f"  cloud  -> {out('cloud.ply')} ({n_pts} pts)")
     return summary
 
 
 if __name__ == "__main__":
     import argparse
+    import sys
 
     ap = argparse.ArgumentParser(description=stitch_session_solved.__doc__.split("\n")[0])
     ap.add_argument("session_dir")
@@ -1212,13 +1608,31 @@ if __name__ == "__main__":
     ap.add_argument("--sign", type=int, default=1, choices=(-1, 1))
     ap.add_argument("--seam-sigma-mm", type=float, default=0.05)
     ap.add_argument("--prior-sigma-mm", type=float, default=1.0)
+    ap.add_argument("--bead-prior", action="store_true",
+                    help="Z-blind solve: flat plate + one dome per feature found in the RGB "
+                         "mosaic, instead of the contact-Z priors (writes gelsight_beadprior_*)")
+    ap.add_argument("--bead-prior-sigma-mm", type=float, default=0.5)
+    ap.add_argument("--bead-thresh-mad", type=float, default=6.0)
+    ap.add_argument("--bead-min-area-mm2", type=float, default=10.0)
+    ap.add_argument("--bead-open-mm", type=float, default=0.75)
+    ap.add_argument("--tag", default=None, help="output prefix gelsight_<tag>_* (default solved / beadprior)")
     args = ap.parse_args()
+    extra = {}
     meta_path = Path(args.session_dir) / "session.json"
     if meta_path.exists():
         with open(meta_path) as f:
             meta = json.load(f)
         args.touch_x = args.touch_x or meta.get("touch_x")
         args.touch_y = args.touch_y or meta.get("touch_y")
+        rep = meta.get("reprocessed")
+        if rep:  # reprocess_overlap_scan output: use its tile geometry and sign
+            ov = [o for o in rep.get("true_overlap", []) if o is not None]
+            if args.touch_overlap is None and ov:
+                args.touch_overlap = min(ov)
+            extra = dict(gelsight_full_width_m=rep["frame_width_m"],
+                         border_fraction=(1.0 - rep["keep_fraction"]) / 2.0, outlier_mm=3.0)
+            if not any(a.startswith("--sign") for a in sys.argv[1:]):
+                args.sign = rep.get("gel_depth_sign", args.sign)
         if args.touch_overlap is None:
             args.touch_overlap = meta.get("overlap", 0.0)
     if not (args.touch_x and args.touch_y):
@@ -1227,4 +1641,7 @@ if __name__ == "__main__":
         args.session_dir, args.touch_x, args.touch_y,
         touch_overlap=args.touch_overlap or 0.0, gel_depth_sign=args.sign,
         seam_sigma_mm=args.seam_sigma_mm, prior_sigma_mm=args.prior_sigma_mm,
+        bead_prior=args.bead_prior, bead_prior_sigma_mm=args.bead_prior_sigma_mm,
+        bead_thresh_mad=args.bead_thresh_mad, bead_min_area_mm2=args.bead_min_area_mm2,
+        bead_open_mm=args.bead_open_mm, output_tag=args.tag, **extra,
     )

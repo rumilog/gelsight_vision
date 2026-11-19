@@ -38,6 +38,9 @@ setup(
             'motion_collect_overlap = gelsight_vision.motion_collect_overlap:main',
             'pipeline_visuo_tactile = gelsight_vision.pipeline_visuo_tactile:main',
             'set_plate = gelsight_vision.set_plate:main',
+            'touch_bead_stations = gelsight_vision.touch_bead_stations:main',
+            'calib_spot_touch = gelsight_vision.calib_spot_touch:main',
+            'calib_bead_sweep = gelsight_vision.calib_bead_sweep:main',
         ],
     },
 )

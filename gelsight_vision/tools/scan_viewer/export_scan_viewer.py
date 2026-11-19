@@ -86,12 +86,12 @@ def _pixel_to_plate(run_dir: Path, solve: dict, H: int, W: int, mm_per_px: float
     }
 
 
-def export(run_dir: Path, out_dir: Path, stride: int, tex_scale: float) -> Path:
+def export(run_dir: Path, out_dir: Path, stride: int, tex_scale: float, tag: str = "solved") -> Path:
     run_dir = run_dir.expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    depth = np.load(run_dir / "gelsight_solved_depth.npy")
-    solve = json.loads((run_dir / "gelsight_solved_solve.json").read_text())
+    depth = np.load(run_dir / f"gelsight_{tag}_depth.npy")
+    solve = json.loads((run_dir / f"gelsight_{tag}_solve.json").read_text())
     mm_per_px = float(solve["mm_per_px"])
     H, W = depth.shape
 
@@ -99,9 +99,9 @@ def export(run_dir: Path, out_dir: Path, stride: int, tex_scale: float) -> Path:
     rows, cols = z.shape
     z.astype("<f4").tofile(out_dir / "heights.bin")
 
-    rgb = cv2.imread(str(run_dir / "gelsight_solved_rgb.png"), cv2.IMREAD_COLOR)
+    rgb = cv2.imread(str(run_dir / f"gelsight_{tag}_rgb.png"), cv2.IMREAD_COLOR)
     if rgb is None:
-        raise FileNotFoundError(run_dir / "gelsight_solved_rgb.png")
+        raise FileNotFoundError(run_dir / f"gelsight_{tag}_rgb.png")
     # crop the RGB mosaic to the same footprint the downsampled grid covers
     sr = rgb.shape[0] / H
     rgb = rgb[: int(round(rows * stride * sr)), : int(round(cols * stride * sr))]
@@ -113,7 +113,7 @@ def export(run_dir: Path, out_dir: Path, stride: int, tex_scale: float) -> Path:
     session = run_dir.parent.name
     meta = {
         "session": session,
-        "run": run_dir.name,
+        "run": run_dir.name if tag == "solved" else f"{run_dir.name} [{tag}]",
         "rows": rows,
         "cols": cols,
         "stride": stride,
@@ -161,6 +161,9 @@ def main() -> None:
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--no-browser", action="store_true")
     ap.add_argument("--skip-export", action="store_true", help="only serve an existing --out folder")
+    ap.add_argument("--tag", default="solved",
+                    help="stitch outputs to read, gelsight_<tag>_* (e.g. beadprior); "
+                         "default out folder is viewer/ for solved, viewer_<tag>/ otherwise")
     a = ap.parse_args()
 
     run_dir = a.run_dir.expanduser().resolve()
@@ -169,11 +172,11 @@ def main() -> None:
     elif a.skip_export and (run_dir / "meta.json").exists():
         out = run_dir  # pointed straight at an exported viewer folder
     else:
-        out = run_dir / "viewer"
+        out = run_dir / ("viewer" if a.tag == "solved" else f"viewer_{a.tag}")
     if a.skip_export and not (out / "meta.json").exists():
         ap.error(f"no exported viewer in {out} (run without --skip-export first)")
     if not a.skip_export:
-        export(a.run_dir, out, a.stride, a.tex_scale)
+        export(a.run_dir, out, a.stride, a.tex_scale, tag=a.tag)
     if a.serve:
         serve(out, a.port, not a.no_browser)
 

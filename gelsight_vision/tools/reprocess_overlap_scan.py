@@ -46,6 +46,7 @@ def reprocess(
     gel_depth_sign: int = -1,
     outlier_mm: float = 3.0,
     stitch: bool = True,
+    bead_prior: bool = False,
 ) -> dict | None:
     """Recompute tiles from `run_dir`'s raw frames into `out_dir`, then stitch.
 
@@ -105,7 +106,7 @@ def reprocess(
         out_dir, touch_x, touch_y,
         touch_overlap=min(o for o in overlap if o is not None) if any(o is not None for o in overlap) else 0.0,
         gelsight_full_width_m=frame_width_m, border_fraction=border,
-        gel_depth_sign=gel_depth_sign, outlier_mm=outlier_mm,
+        gel_depth_sign=gel_depth_sign, outlier_mm=outlier_mm, bead_prior=bead_prior,
     )
 
 
@@ -120,11 +121,14 @@ def main() -> None:
     ap.add_argument("--outlier-mm", type=float, default=3.0,
                     help="relief further than this from the tile median is dropped")
     ap.add_argument("--no-stitch", action="store_true")
+    ap.add_argument("--bead-prior", action="store_true",
+                    help="stitch Z-blind with the bead-shape prior (writes gelsight_beadprior_*)")
     a = ap.parse_args()
     run = a.run_dir.expanduser().resolve()
     out = a.out or run.with_name(run.name + "_reprocessed")
     reprocess(run, out, keep=a.keep, width_px=a.width_px, frame_width_m=a.frame_width_mm / 1e3,
-              gel_depth_sign=a.sign, outlier_mm=a.outlier_mm, stitch=not a.no_stitch)
+              gel_depth_sign=a.sign, outlier_mm=a.outlier_mm, stitch=not a.no_stitch,
+              bead_prior=a.bead_prior)
 
 
 if __name__ == "__main__":
