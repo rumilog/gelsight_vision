@@ -30,6 +30,13 @@ hf upload rlogh/gelsight-overlap-scans <session> <session> --repo-type dataset
 
 Then add a row to the Sessions table in the dataset README and in the table above.
 
+The same dataset also has `bead_touch/<date>/`, which holds camera-guided bead touch sessions (see [Bead pipeline](#bead-pipeline-first-hardware-runs-2026-11-19)). Each date folder has its own README. To download only that part:
+
+```bash
+hf download rlogh/gelsight-overlap-scans --repo-type dataset --include "bead_touch/2026-11-19/*" \
+    --local-dir ~/HuggingFace/Datasets/gelsight-overlap-scans
+```
+
 3D viewer for the stitched scan (browser, three.js; needs internet for the CDN):
 
 ```bash
@@ -63,12 +70,13 @@ The older tactile + D555 dataset, `ppak10/Gelsight-Welds` (local clone at `~/Hug
 
 ## Bead pipeline: first hardware runs (2026-11-19)
 
-The D555 photo finds the weld bead, then the GelSight touches stations along it and records bead height (contact Z above a plate plane fitted to nearby plate touches). Nodes and parameters are in `gelsight_vision/bead/README.md`. All sessions below are local only (`captures_*` is not in git).
+The D555 photo finds the weld bead, then the GelSight touches stations along it and records bead height (contact Z above a plate plane fitted to nearby plate touches). Nodes and parameters are in `gelsight_vision/bead/README.md`. The sessions below are on Hugging Face under `rlogh/gelsight-overlap-scans` → `bead_touch/2026-11-19/{calib_spot,calib_sweep,bead_stations}/<session>/`. That folder's README covers the file layout and units. The sweeps there are re-analyzed with the band-midpoint crown reading, and the originals are kept as `sweep_result_peak.json`. Local copies are in `captures_*/`, which is not in git.
 
 | Session | What | Result |
 |---|---|---|
 | `captures_calib_spot/2026-11-19_10-30-28` | Spot calibration on electrical-tape squares | 12/12 touches landed where clicked, but `calib_result.json` is not usable (1.7 mm residual): the tape was larger than the gel view, so the feature finder hit a different tape edge each time. Use ~3 mm dots and click their centres. |
 | `captures_calib_sweep/2026-11-19_10-35-29` | Bead sweep at plate x = 50.5 mm, ±8 mm in 1 mm steps | Crown tracking slope -0.97, single-frame precision 0.08 mm, bead height 1.71 mm. The contact-band centre is 3.27 mm along the bead normal from the image centerline. `calib_from_sweep_band.json` in this folder is hand-made from that. |
+| `captures_calib_sweep/2026-11-19_11-00-29` | Same sweep, centred on the GelSight-felt bead at (50.5, 80.4) mm | 1.74 mm; band centre at y = 77.2 mm, matching `10-35-29` |
 | `captures_calib_sweep/2026-11-19_11-19-32` | Re-measure at x = 25.9 mm, ±2 mm | 1.59 mm; band centre at y = 77.7 mm (77.1 at x = 50) |
 | `captures_bead/2026-11-19_10-40-59` | 3 stations, old 6.5 mm (peak-based) correction | 1.58 / 1.74 / 1.88 mm at x = 22 / 49 / 76; the centerline stopped at x = 97 (fixed since) |
 | `captures_bead/2026-11-19_11-13-42` | 5 stations, old correction | T5 read 4.54 mm: the GelSight frame shows a smooth cylinder across the bead, most likely the sensor cable under the gel at yaw ~90°. Excluded. |
