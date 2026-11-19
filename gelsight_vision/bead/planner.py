@@ -185,9 +185,14 @@ def plate_reference_stations(line: BeadLine, calib: Calibration, n: int = 3,
         pts = []
         for j, st in enumerate(beside):
             c, nrm = np.asarray(st.image_target_mm, float), np.asarray(st.normal, float)
+            # Alternate sides so the plate plane is pinned across the bead too. Try the
+            # wanted side at every distance before giving up on it: with the distance
+            # loop outside, a centerline wiggle of a few tenths of a mm made the 22 mm
+            # point fail and flipped it to the other side (all 5 refs on one side,
+            # captures_bead/2026-11-19_11-04-31).
             options = [c + side * dist * nrm
-                       for dist in (clearance_mm, clearance_mm + 3, clearance_mm + 6)
-                       for side in ((1, -1) if j % 2 == 0 else (-1, 1))]
+                       for side in ((1, -1) if j % 2 == 0 else (-1, 1))
+                       for dist in (clearance_mm, clearance_mm + 3, clearance_mm + 6)]
             ok = [p for p in options if inside(p) and clear(p)]
             if ok:
                 pts.append(ok[0])
@@ -216,14 +221,31 @@ def plate_reference_stations(line: BeadLine, calib: Calibration, n: int = 3,
     return out
 
 
-def fit_plate_plane(xy_mm, z_mm) -> tuple[np.ndarray, float]:
-    """z = a x + b y + c through the plate-reference contacts. Returns (coef, rms)."""
+def fit_plate_plane(xy_mm, z_mm, min_spread_mm: float = 10.0) -> tuple[np.ndarray, float]:
+    """z = a x + b y + c through the plate-reference contacts. Returns (coef, rms).
+
+    If the points lie nearly on a line (spread across it < min_spread_mm, e.g. all
+    refs on one side of the bead), the tilt across that line is not measurable:
+    a few hundredths of a mm of contact noise over a few mm of spread, extrapolated
+    22 mm to the bead, would come out as tenths of a mm. Then only the tilt along
+    the line is fitted and the plate is taken as level across it.
+    """
     xy = np.asarray(xy_mm, float)
     z = np.asarray(z_mm, float)
     if len(z) == 0:
         return np.array([0.0, 0.0, np.nan]), float('nan')
     if len(z) < 3:  # level plate assumed
         return np.array([0.0, 0.0, float(np.mean(z))]), float(np.std(z))
+    m = xy.mean(0)
+    _, sv, vt = np.linalg.svd(xy - m, full_matrices=False)
+    spread = sv / np.sqrt(len(z))           # std of the points along each principal axis
+    if spread[1] * 4 < min_spread_mm:       # ~ full width across the line < min_spread_mm
+        t = (xy - m) @ vt[0]
+        k, c0 = np.polyfit(t, z, 1)
+        a, b = k * vt[0]
+        coef = np.array([a, b, c0 - k * float(vt[0] @ m)])
+    else:
+        A = np.c_[xy, np.ones(len(z))]
+        coef, *_ = np.linalg.lstsq(A, z, rcond=None)
     A = np.c_[xy, np.ones(len(z))]
-    coef, *_ = np.linalg.lstsq(A, z, rcond=None)
     return coef, float(np.sqrt(np.mean((A @ coef - z) ** 2)))

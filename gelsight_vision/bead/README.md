@@ -83,6 +83,11 @@ centre is re-touched once, shifted onto the crown.
 Offline planning, no ROS: `python3 -m gelsight_vision.tools.plan_bead_offline <color.png> --corners-px ... --corners-mm ...`
 
 ## Known limits
+- The crown reading (`read_crown().crown_u_mm`) is the midpoint of the gel contact band.
+  The as-welded bead reads flat-topped with raised edges, so the strongest-contact point
+  (kept as `crown_peak_u_mm`) sits ~3 mm to one side and can jump between edges.
+  Calibrations made from peak readings (e.g. `calib_from_sweep.json`, 6.5 mm) don't
+  match the midpoint reading; use `calib_from_sweep_band.json` (3.27 mm) from 2026-11-19.
 - Bead segmentation was tuned on one snapshot. The bright region is ~2× wider than the raised bead,
   and the centerline can sit a few mm off the crown. Experiment 1 and the re-touch absorb that.
 - Height is robot contact Z minus the plate plane, with no gel-compression correction.

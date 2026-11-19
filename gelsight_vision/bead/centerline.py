@@ -114,28 +114,44 @@ def segment_bead(ortho: PlateOrtho, max_bead_width_mm: float = 25.0,
     return ndi.binary_fill_holes(lab == (k + 1))
 
 
-def _medial_path(mask: np.ndarray) -> np.ndarray:
-    """Geodesic path between the two bead ends, weighted to hug the medial axis."""
+def _medial_path(mask: np.ndarray, core_frac: float = 0.4) -> np.ndarray:
+    """Geodesic path between the two bead ends, weighted to hug the medial axis.
+
+    The ends are found with plain (step-length) geodesic distance, restricted to
+    interior pixels (distance to the mask edge >= core_frac x its maximum). Under
+    the medial-axis weighting every edge pixel is expensive to reach, so the
+    "farthest" pixel there is whichever sits deepest in a narrow crevice -- on
+    2026-11-19 a notch at x ~ 95 mm ended the line two-thirds along the bead.
+    """
     dt = ndi.distance_transform_edt(mask)
     ys, xs = np.nonzero(mask)
     idx = -np.ones(mask.shape, int)
     idx[ys, xs] = np.arange(len(ys))
-    rows, cols, wts = [], [], []
+    rows, cols, lens, wts = [], [], [], []
     for dy, dx in [(0, 1), (1, 0), (1, 1), (1, -1)]:
         y2, x2 = ys + dy, xs + dx
         ok = (y2 >= 0) & (y2 < mask.shape[0]) & (x2 >= 0) & (x2 < mask.shape[1])
         ok[ok] &= mask[y2[ok], x2[ok]]
         a, b = idx[ys[ok], xs[ok]], idx[y2[ok], x2[ok]]
-        w = np.hypot(dy, dx) / (0.5 * (dt[ys[ok], xs[ok]] + dt[y2[ok], x2[ok]])) ** 2
+        step = np.full(len(a), np.hypot(dy, dx))
+        w = step / (0.5 * (dt[ys[ok], xs[ok]] + dt[y2[ok], x2[ok]])) ** 2
         rows += [a, b]
         cols += [b, a]
+        lens += [step, step]
         wts += [w, w]
-    G = coo_matrix((np.concatenate(wts), (np.concatenate(rows), np.concatenate(cols))),
-                   shape=(len(ys), len(ys))).tocsr()
-    d0 = dijkstra(G, indices=0)
-    e1 = int(np.argmax(np.where(np.isfinite(d0), d0, -1)))
-    d1, pred = dijkstra(G, indices=e1, return_predecessors=True)
-    e2 = int(np.argmax(np.where(np.isfinite(d1), d1, -1)))
+    rows, cols = np.concatenate(rows), np.concatenate(cols)
+    n = len(ys)
+    G_len = coo_matrix((np.concatenate(lens), (rows, cols)), shape=(n, n)).tocsr()
+    G = coo_matrix((np.concatenate(wts), (rows, cols)), shape=(n, n)).tocsr()
+    core = dt[ys, xs] >= core_frac * dt.max()
+
+    def farthest_core(src: int) -> int:
+        d = dijkstra(G_len, indices=src)
+        return int(np.argmax(np.where(core & np.isfinite(d), d, -1)))
+
+    e1 = farthest_core(farthest_core(int(np.argmax(dt[ys, xs]))))
+    e2 = farthest_core(e1)
+    _, pred = dijkstra(G, indices=e1, return_predecessors=True)
     path = [e2]
     while path[-1] != e1 and path[-1] >= 0:
         path.append(int(pred[path[-1]]))

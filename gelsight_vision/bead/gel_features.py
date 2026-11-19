@@ -85,13 +85,15 @@ def locate_compact_feature(raw, baseline, feature_mm: float = 1.5, border_mm: fl
 
 @dataclass
 class CrownReading:
-    crown_u_mm: float          # crown position along the long axis (0 = frame centre)
+    crown_u_mm: float          # bead position along the long axis (0 = frame centre):
+                               # midpoint of the in-contact band
     band_width_mm: float       # width of the in-contact band around the crown
     contact_fraction: float    # share of the frame in contact
     edge_contact_left: float   # mean contact level in the first 15% of u / band level
     edge_contact_right: float
     plate_both_sides: bool     # heuristic: gel touches something at both ends of u
-    crown_near_edge: bool      # crown within 2 mm of a frame end -> re-touch
+    crown_near_edge: bool      # band reaches a frame end, or crown within 2 mm of one
+    crown_peak_u_mm: float = float('nan')   # strongest-contact point (the old crown_u_mm)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -99,12 +101,20 @@ class CrownReading:
 
 def read_crown(raw, baseline, edge_frac: float = 0.15, contact_rel: float = 0.25,
                edge_rel: float = 0.35) -> CrownReading:
-    """Locate the bead crown along u for a touch with the long axis ACROSS the bead.
+    """Locate the bead along u for a touch with the long axis ACROSS the bead.
 
     Profile = median over v of the contact map (a bead crossing the frame shows
-    as a band of contact perpendicular to u). The crown is the profile peak
-    (parabolic sub-pixel refine). Thresholds are first guesses from the
-    2026-11-16 frames; recalibrate them from calib_bead_sweep output.
+    as a band of contact perpendicular to u). crown_u_mm is the midpoint of the
+    in-contact band around the profile peak (threshold contact_rel x peak,
+    sub-pixel crossings); the peak itself is kept as crown_peak_u_mm.
+
+    Why the midpoint (2026-11-19): the as-welded bead reads flat-topped with
+    raised edges, so the peak sits on one edge and can jump to the other. On
+    station 1 of captures_bead/2026-11-19_11-13-42 a 3.78 mm re-touch moved the
+    peak reading by 6.4 mm and the band midpoint by 3.65 mm. In the
+    2026-11-19_10-35-29 sweep both are linear in the offset (slope ~ -1), with
+    the peak ~3.3 mm to +u of the midpoint. A band that reaches a frame end is
+    cut off, so its midpoint is biased: crown_near_edge is set then.
     """
     cmap, mmpx = contact_map(raw, baseline)
     prof = ndi.gaussian_filter1d(np.median(cmap, axis=0), 2.0)
@@ -118,18 +128,28 @@ def read_crown(raw, baseline, edge_frac: float = 0.15, contact_rel: float = 0.25
         di = 0.0
     n = len(p)
     peak = max(float(p[i]), 1e-9)
-    above = p > contact_rel * peak
-    lab, _ = ndi.label(above)
-    band = lab == lab[i]
+    thr = contact_rel * peak
+    lo = i
+    while lo > 0 and p[lo - 1] > thr:
+        lo -= 1
+    hi = i
+    while hi < n - 1 and p[hi + 1] > thr:
+        hi += 1
+    # sub-pixel threshold crossings (the band edges)
+    f_lo = lo - (p[lo] - thr) / (p[lo] - p[lo - 1]) if lo > 0 and p[lo] != p[lo - 1] else lo
+    f_hi = hi + (p[hi] - thr) / (p[hi] - p[hi + 1]) if hi < n - 1 and p[hi] != p[hi + 1] else hi
+    band_cut = lo == 0 or hi == n - 1
     e = max(1, int(edge_frac * n))
     left, right = float(p[:e].mean() / peak), float(p[-e:].mean() / peak)
-    crown_u = float((i + di - (n - 1) / 2) * mmpx)
+    crown_u = float(((f_lo + f_hi) / 2 - (n - 1) / 2) * mmpx)
+    peak_u = float((i + di - (n - 1) / 2) * mmpx)
     half = GEL_FULL_WIDTH_MM / 2
     c0 = np.percentile(cmap, 5)
     return CrownReading(
         crown_u_mm=crown_u,
-        band_width_mm=float(band.sum() * mmpx),
+        band_width_mm=float((f_hi - f_lo) * mmpx),
         contact_fraction=float((cmap - c0 > contact_rel * (cmap.max() - c0)).mean()),
         edge_contact_left=left, edge_contact_right=right,
         plate_both_sides=bool(left > edge_rel and right > edge_rel),
-        crown_near_edge=bool(abs(crown_u) > half - 2.0))
+        crown_near_edge=bool(band_cut or abs(crown_u) > half - 2.0),
+        crown_peak_u_mm=peak_u)

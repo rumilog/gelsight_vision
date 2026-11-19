@@ -22,9 +22,24 @@ import os
 
 import cv2
 import numpy as np
+from scipy import ndimage as ndi
 
 from gelsight_vision.bead.calib import analyze_bead_sweep
-from gelsight_vision.bead.gel_features import GEL_FULL_WIDTH_MM, read_crown
+from gelsight_vision.bead.gel_features import GEL_FULL_WIDTH_MM, contact_map, read_crown
+
+
+def _contact_columns(raw, baseline, u_mm: np.ndarray, contact_rel: float = 0.25) -> np.ndarray:
+    """True where the gel touches something, at the depth-map columns u_mm.
+
+    Same contact profile as read_crown (median over v of |frame - baseline|),
+    resampled from the full-frame contact map onto the centred depth crop.
+    Where the gel hangs free the depth reconstruction is meaningless.
+    """
+    cmap, cmmpx = contact_map(raw, baseline)
+    prof = ndi.gaussian_filter1d(np.median(cmap, axis=0), 2.0)
+    p = prof - float(np.percentile(prof, 5))
+    uc = (np.arange(len(p)) - (len(p) - 1) / 2) * cmmpx
+    return np.interp(u_mm, uc, p) > contact_rel * max(float(p.max()), 1e-9)
 
 
 def _load(session_dir: str, prefix: str) -> list[dict]:
@@ -52,10 +67,15 @@ def analyze_sweep_session(session_dir: str, gel_depth_sign: float = -1.0) -> dic
                         'crown': crown})
         if os.path.exists(stem + '_depth.npy'):
             dep = np.load(stem + '_depth.npy').astype(float)
-            prof = gel_depth_sign * np.median(dep, axis=0)
             mmpx = GEL_FULL_WIDTH_MM * keep / dep.shape[1]
             u = (np.arange(dep.shape[1]) - (dep.shape[1] - 1) / 2) * mmpx
-            profiles.append((meta['offset_mm'], u, prof))
+            # Depth is in gel pixels (same lateral scale as u), not mm.
+            prof = gel_depth_sign * np.median(dep, axis=0) * mmpx
+            in_contact = (_contact_columns(raw, baseline, u)
+                          if raw is not None and baseline is not None else None)
+            profiles.append({'offset_mm': meta['offset_mm'], 'u_mm': u, 'height_mm': prof,
+                             'in_contact': in_contact,
+                             'crown_u_mm': None if crown is None else crown['crown_u_mm']})
     refs = [{'tooltip_mm': r['target_plate_mm'], 'contact_z_mm': r.get('contact_z_mm')}
             for r in _load(session_dir, 'plate_ref') if r.get('valid_contact')]
     result = analyze_bead_sweep(touches, refs)
@@ -102,14 +122,26 @@ def _plot(session_dir, res, profiles):
     hmap = dict(zip(res['offsets_mm'], res['contact_height_mm']))
     cm = plt.get_cmap('viridis')
     span = max(1e-6, float(np.ptp(dd)))
-    for off, uu, prof in profiles:
-        x = off + sgn * uu
+    drawn = skipped = 0
+    for pr in profiles:
+        off, uu, prof, cu = pr['offset_mm'], pr['u_mm'], pr['height_mm'], pr['crown_u_mm']
         top = hmap.get(off)
-        y = prof - prof.max() + (top if top is not None else 0.0)
-        ax[2].plot(x, y, color=cm((off - dd.min()) / span), lw=0.8)
+        # Anchor at the crown (the point the robot's contact Z belongs to), not at the
+        # profile max, which is often an edge artefact. Skip frames whose crown is
+        # outside the depth crop: nothing in them can be anchored.
+        if top is None or cu is None or not (uu[0] + 0.5 <= cu <= uu[-1] - 0.5):
+            skipped += 1
+            continue
+        y = prof - float(np.interp(cu, uu, prof)) + top
+        if pr['in_contact'] is not None:
+            y = np.where(pr['in_contact'], y, np.nan)
+        ax[2].plot(off + sgn * uu, y, color=cm((off - dd.min()) / span), lw=0.8)
+        drawn += 1
+    ax[2].axhline(0.0, color='0.6', lw=0.8, ls=':')
     ax[2].set(xlabel='position across bead (mm, 0 = planned station)',
-              ylabel='height (mm, gel profile anchored at contact Z)',
-              title='cross-section from overlaid GelSight profiles (approx.)')
+              ylabel='height above plate (mm)',
+              title=f'GelSight cross-section, in-contact only\n'
+                    f'({drawn} frames; {skipped} skipped: crown outside depth crop)')
     fig.tight_layout()
     fig.savefig(os.path.join(session_dir, 'sweep_summary.png'), dpi=90)
     plt.close(fig)
