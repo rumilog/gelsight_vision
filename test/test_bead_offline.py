@@ -86,6 +86,9 @@ def test_centerline_and_stations(curve):
     assert len(refs) == 3
     for r in refs:
         assert np.min(np.linalg.norm(line.xy_mm - r.target_mm, axis=1)) > 21.5
+    sides = [np.sign((np.asarray(r.target_mm) - s.target_mm) @ np.asarray(s.normal))
+             for r, s in zip(refs, st)]
+    assert all(a != b for a, b in zip(sides, sides[1:]))     # refs alternate across the bead
 
 
 def test_yaw_fold_is_consistent():
@@ -198,3 +201,36 @@ def test_real_snapshot_plan():
     for s in bp.stations:          # bead runs along plate x at y ~ 73-76 mm
         assert 70 < s.target_mm[1] < 80
         assert abs(math.degrees(s.yaw_rad) - 90) < 6
+
+
+def test_read_crown_uses_band_midpoint_on_flat_topped_bead():
+    # flat-topped bead with raised edges: two ridges at u = 1.0 and 5.0 mm, the
+    # +u one brighter. The peak sits on that edge; the band midpoint stays at 3.0.
+    h, w = 720, 1280
+    mmpx = 19.9 / w
+    u = (np.arange(w) - (w - 1) / 2) * mmpx
+    rng = np.random.default_rng(4)
+    base = np.full((h, w, 3), 120.0)
+    prof = (35 * np.exp(-0.5 * ((u - 1.0) / 0.8) ** 2) + 50 * np.exp(-0.5 * ((u - 5.0) / 0.8) ** 2)
+            + 25 * ((u > 1.0) & (u < 5.0)))
+    raw = base + prof[None, :, None] + rng.normal(0, 2, (h, w, 3))
+    cr = read_crown(raw.clip(0, 255).astype(np.uint8), base.astype(np.uint8))
+    assert abs(cr.crown_peak_u_mm - 5.0) < 0.3
+    assert abs(cr.crown_u_mm - 3.0) < 0.3
+    assert not cr.crown_near_edge
+
+
+def test_fit_plate_plane_one_sided_refs_stay_level_across():
+    from gelsight_vision.bead.planner import fit_plate_plane
+    # refs all on one side of a bead along x (y ~ 55-58): noise must not be
+    # extrapolated into a cross-bead tilt at the bead (y = 80)
+    xy = np.array([[124.2, 58.6], [96.0, 57.8], [74.6, 57.9], [49.8, 58.2], [26.7, 54.9]])
+    z = 5.0 + 0.0005 * xy[:, 0] + np.array([0.03, -0.02, 0.01, -0.03, 0.02])
+    coef, _ = fit_plate_plane(xy, z)
+    for x in (26.0, 75.0, 123.0):
+        assert abs(coef @ [x, 80.0, 1.0] - (5.0 + 0.0005 * x)) < 0.04
+    # refs on both sides: the full plane (incl. cross tilt) is still fitted
+    xy2 = np.array([[124, 52], [95, 99], [75, 52], [50, 102], [27, 55]], float)
+    z2 = 5.0 + 0.002 * xy2[:, 1]
+    coef2, rms2 = fit_plate_plane(xy2, z2)
+    assert abs(coef2[1] - 0.002) < 1e-6 and rms2 < 1e-9
